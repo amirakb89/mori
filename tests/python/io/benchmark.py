@@ -250,6 +250,14 @@ def parse_args():
         "per completion at the cost of burning a core while waiting.",
     )
     parser.add_argument(
+        "--prepare-once",
+        action="store_true",
+        help="Build the transfer work requests once (per size/batch) and re-post them "
+        "each iteration, hoisting descriptor-build cost out of the timed loop (the NIXL "
+        "createXferReq/postXferReq split). Falls back to the inline path if the backend "
+        "does not support prepared transfers.",
+    )
+    parser.add_argument(
         "--disable-chunking",
         action="store_true",
         help="Disable single-transfer chunking (chunking is enabled by default)",
@@ -371,6 +379,7 @@ class MoriIoBenchmark:
         post_batch_size: int = -1,
         num_worker_threads: int = 1,
         busy_wait: bool = False,
+        prepare_once: bool = False,
         poll_cq_mode: str = "polling",
         max_send_wr: int = 0,
         max_cqe_num: int = 0,
@@ -413,6 +422,16 @@ class MoriIoBenchmark:
         self.post_batch_size = post_batch_size
         self.num_worker_threads = num_worker_threads
         self.busy_wait = busy_wait
+        # Prepared (build-once, post-many) handles live on a session, so
+        # --prepare-once requires --enable-sess.
+        if prepare_once and not self.enable_sess:
+            raise ValueError("--prepare-once requires --enable-sess")
+        self.prepare_once = prepare_once
+        # Cache of prepared handles keyed by (buffer_size, transfer_batch_size).
+        # Built lazily on first run_*_once for a size, reused across warmup+timed
+        # iters, and cleared between sweep points via _reset_prepared().
+        self._prepared_cache = {}
+        self._prepare_unsupported_warned = False
         self.poll_cq_mode = (
             PollCqMode.POLLING if poll_cq_mode == "polling" else PollCqMode.EVENT
         )
@@ -986,6 +1005,56 @@ class MoriIoBenchmark:
         else:
             status.Wait()
 
+    def _reset_prepared(self):
+        # Prepared handles capture offsets/sizes at build time, so they are only
+        # valid for the (buffer_size, batch) they were built for. Drop them when
+        # moving to a new sweep point.
+        self._prepared_cache = {}
+
+    def _warn_prepare_unsupported(self):
+        if not self._prepare_unsupported_warned:
+            print(
+                "[bench] --prepare-once: backend returned no prepared handle; "
+                "falling back to the inline transfer path.",
+                flush=True,
+            )
+            self._prepare_unsupported_warned = True
+
+    def _get_prepared_batch(
+        self, buffer_size, transfer_batch_size, offsets, sizes, is_read
+    ):
+        # Build (once) and cache the prepared handle for the batched path. Returns
+        # None if the backend does not support prepared transfers (caller falls
+        # back to inline). Prepared transfers live on a session (--enable-sess).
+        key = ("batch", buffer_size, transfer_batch_size, is_read)
+        if key in self._prepared_cache:
+            return self._prepared_cache[key]
+        prepared = self.sess.prepare_batch(offsets, offsets, sizes, is_read)
+        if prepared is None:
+            self._warn_prepare_unsupported()
+        self._prepared_cache[key] = prepared
+        return prepared
+
+    def _get_prepared_singles(self, buffer_size, transfer_batch_size, is_read):
+        # Build (once) and cache one 1-element prepared handle per transfer in the
+        # single-transfer path. Returns None (whole list) if unsupported.
+        key = ("single", buffer_size, transfer_batch_size, is_read)
+        if key in self._prepared_cache:
+            return self._prepared_cache[key]
+        prepared_list = []
+        for i in range(transfer_batch_size):
+            offset = buffer_size * i
+            off = np.array([offset], dtype=np.uint64)
+            sz = np.array([buffer_size], dtype=np.uint64)
+            p = self.sess.prepare_batch(off, off, sz, is_read)
+            if p is None:
+                self._warn_prepare_unsupported()
+                self._prepared_cache[key] = None
+                return None
+            prepared_list.append(p)
+        self._prepared_cache[key] = prepared_list
+        return prepared_list
+
     def run_single_once(self, buffer_size, transfer_batch_size):
         assert buffer_size <= self.buffer_size
         if (
@@ -999,6 +1068,31 @@ class MoriIoBenchmark:
 
         for i in range(transfer_batch_size):
             transfer_uids.append(self.engine.allocate_transfer_uid())
+
+        is_read = self.op_type == "read"
+        prepared_list = None
+        if self.prepare_once:
+            prepared_list = self._get_prepared_singles(
+                buffer_size, transfer_batch_size, is_read
+            )
+
+        if prepared_list is not None:
+            # Prepared (build-once, post-many): each single transfer's WR list was
+            # built outside the timed loop; only re-posting is timed here.
+            st = time.time()
+            for i in range(transfer_batch_size):
+                status = self.sess.post_prepared(prepared_list[i], transfer_uids[i])
+                status_list.append(status)
+            launched = time.time()
+            for status in status_list:
+                self._wait_status(status)
+            done = time.time()
+
+            launch_duration = launched - st
+            transfer_duration = done - launched
+            for status in status_list:
+                assert status.Succeeded(), f"Transfer failed: {status.Message()}"
+            return launch_duration, transfer_duration
 
         func, arg_list = None, []
         for i in range(transfer_batch_size):
@@ -1057,7 +1151,19 @@ class MoriIoBenchmark:
         sizes = np.full(transfer_batch_size, buffer_size, dtype=np.uint64)
         transfer_uid = self.engine.allocate_transfer_uid()
 
-        if self.enable_sess:
+        is_read = self.op_type == "read"
+        prepared = None
+        if self.prepare_once:
+            prepared = self._get_prepared_batch(
+                buffer_size, transfer_batch_size, offsets, sizes, is_read
+            )
+
+        if prepared is not None:
+            # Prepared (build-once, post-many): the WR list was built outside the
+            # timed loop; only the post is timed here.
+            st = time.time()
+            transfer_status = self.sess.post_prepared(prepared, transfer_uid)
+        elif self.enable_sess:
             func = (
                 self.sess.batch_read
                 if self.op_type == "read"
@@ -1107,6 +1213,9 @@ class MoriIoBenchmark:
             return self.run_single_once(buffer_size, transfer_batch_size)
 
     def _run_and_compute(self, buffer_size, transfer_batch_size, iters):
+        # Prepared handles capture offsets/sizes for a specific (size, batch); drop
+        # any from a previous sweep point so this point rebuilds them once.
+        self._reset_prepared()
         for _ in range(self.warmup_iters):
             self.run_once(buffer_size, transfer_batch_size)
 
@@ -1366,6 +1475,7 @@ def benchmark_xgmi_worker(local_rank, node_rank, args):
         num_streams=args.num_streams,
         num_events=args.num_events,
         busy_wait=args.busy_wait,
+        prepare_once=args.prepare_once,
         xgmi_multiprocess=True,
     )
     bench.print_config()
@@ -1407,6 +1517,7 @@ def benchmark_engine(local_rank, node_rank, args):
         post_batch_size=args.post_batch_size,
         num_worker_threads=args.num_worker_threads,
         busy_wait=args.busy_wait,
+        prepare_once=args.prepare_once,
         poll_cq_mode=args.poll_cq_mode,
         max_send_wr=args.max_send_wr,
         max_cqe_num=args.max_cqe_num,
@@ -1478,6 +1589,7 @@ def benchmark_xgmi(args):
             num_streams=args.num_streams,
             num_events=args.num_events,
             busy_wait=args.busy_wait,
+        prepare_once=args.prepare_once,
             xgmi_multiprocess=False,
         )
         bench.print_config()

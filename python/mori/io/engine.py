@@ -79,6 +79,16 @@ class IOEngineSession:
     def batch_write(self, *args):
         return self._batch_single_side_transfer(self._sess.BatchWrite, *args)
 
+    def prepare_batch(self, local_offsets, remote_offsets, sizes, is_read):
+        # Build the work requests once; returns a reusable handle (None if the
+        # backend does not support prepared transfers).
+        return self._sess.PrepareBatch(local_offsets, remote_offsets, sizes, is_read)
+
+    def post_prepared(self, prepared, transfer_uid):
+        transfer_status = mori_cpp.TransferStatus()
+        self._sess.PostPrepared(prepared, transfer_status, transfer_uid)
+        return transfer_status
+
     def alive(self):
         return self._sess.Alive()
 
