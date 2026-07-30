@@ -164,6 +164,12 @@ class BackendSession {
   // submits it with a fresh status/id. The default implementation returns
   // nullptr / reports unsupported, so backends may opt in. Offsets/sizes are
   // captured at prepare time and must not change between posts.
+  //
+  // A handle is bound to the session that created it and may only be posted
+  // through that session. Posting is submitted from the calling thread, so a
+  // backend configured with an internal worker pool may decline to prepare
+  // (returns nullptr) rather than silently bypass it; callers must treat a null
+  // handle as "use the regular batch path".
   virtual std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
                                                          const SizeVec& remoteOffsets,
                                                          const SizeVec& sizes, bool isRead) {

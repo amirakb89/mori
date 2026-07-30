@@ -1446,7 +1446,17 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 // Concrete prepared-transfer handle for the RDMA backend: owns the built
 // (sorted/merged/chunked) work-request list so PostPrepared can re-post it.
 struct RdmaPreparedTransfer : public PreparedTransfer {
+  explicit RdmaPreparedTransfer(const RdmaBackendSession* owner_) : owner(owner_) {}
+
+  // The WR addresses were built against this session's memory descriptors.
+  // Posting through another session would combine those addresses with a
+  // different session's QPs/MRs and is therefore invalid.
+  const RdmaBackendSession* const owner;
   PreparedRdmaBatch batch;
+  // Each post re-arms the shared WR list in place (lkey/rkey, wr_id, send_flags,
+  // next chain). Serialize posts of the SAME handle so concurrent callers can't
+  // corrupt that chain; distinct handles stay fully parallel.
+  std::mutex postMu;
 };
 
 std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec& localOffsets,
@@ -1458,15 +1468,26 @@ std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec
     MORI_IO_WARN("PrepareBatch: session has no endpoints/memory regions");
     return nullptr;
   }
-  // The prepared path uses the inline (non-executor) posting route, mirroring
-  // the RdmaBatchReadWrite `else` branch control setup.
+  // The prepared path always posts inline from the calling thread, so it would
+  // silently ignore the worker pool that BatchReadWrite uses. Rather than report
+  // numbers for a posting model the caller did not ask for, refuse up front.
+  // Prepared transfers still use every QP in the session (qpPerTransfer); only
+  // multi-threaded submission is unavailable.
+  if (executor != nullptr) {
+    MORI_IO_WARN(
+        "PrepareBatch is unsupported with numWorkerThreads>1: the prepared path posts inline "
+        "from the calling thread and would bypass the worker pool. Set numWorkerThreads=1 "
+        "(qpPerTransfer is unaffected) to use prepared transfers.");
+    return nullptr;
+  }
+  // Control setup mirrors the RdmaBatchReadWrite `else` (inline) branch.
   const bool chunk = config.enableTransferChunking;
   RdmaTransferControl control{};
   control.chunkBytes = chunk ? config.chunkBytes : 0;
   control.maxChunks = config.maxChunksPerTransfer;
   control.creditByWrCount = chunk;
 
-  auto handle = std::make_shared<RdmaPreparedTransfer>();
+  auto handle = std::make_shared<RdmaPreparedTransfer>(this);
   RdmaOpRet ret =
       BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(), localOffsets,
                              remoteOffsets, sizes, isRead, control, config.postBatchSize,
@@ -1488,6 +1509,11 @@ void RdmaBackendSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& p
     status->Update(StatusCode::ERR_INVALID_ARGS, "invalid prepared transfer handle");
     return;
   }
+  if (handle->owner != this) {
+    status->Update(StatusCode::ERR_INVALID_ARGS,
+                   "prepared transfer belongs to a different RDMA session");
+    return;
+  }
 
   // When !creditByWrCount, totalBatchSize is the original request count; the
   // chunked path overwrites it inside PostMergedWorkRequests (ownsTotalBatchSize).
@@ -1495,8 +1521,13 @@ void RdmaBackendSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& p
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
-  RdmaOpRet ret =
-      PostPreparedRdmaBatch(eps, localMrPerEp, remoteMrPerEp, handle->batch, callbackMeta, id);
+  // Guard the in-place re-arm + ibv_post_send of the shared WR list so two
+  // threads posting the same handle can't interleave and corrupt the chain.
+  RdmaOpRet ret;
+  {
+    std::lock_guard<std::mutex> postLock(handle->postMu);
+    ret = PostPreparedRdmaBatch(eps, localMrPerEp, remoteMrPerEp, handle->batch, callbackMeta, id);
+  }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
     status->Update(ret.code, ret.message);

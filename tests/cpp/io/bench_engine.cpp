@@ -386,6 +386,15 @@ int main(int argc, char** argv) {
               << std::endl;
     std::exit(1);
   }
+  // The prepared path posts inline from this thread, so a worker pool would be
+  // ignored and the reported thread count would not match what ran. QP-level
+  // parallelism is unaffected: --num-qp-per-transfer still applies.
+  if (a.prepare_once && a.worker_threads > 1) {
+    std::cerr << "--prepare-once requires --num-worker-threads 1 (the prepared path posts "
+                 "inline from the calling thread; use --num-qp-per-transfer for QP parallelism)"
+              << std::endl;
+    std::exit(1);
+  }
 
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
 

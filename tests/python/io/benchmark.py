@@ -426,6 +426,15 @@ class MoriIoBenchmark:
         # --prepare-once requires --enable-sess.
         if prepare_once and not self.enable_sess:
             raise ValueError("--prepare-once requires --enable-sess")
+        # The prepared path posts inline from the calling thread, so a worker pool
+        # would be ignored. Reject it here instead of letting prepare_batch return
+        # None and silently falling back to the inline path mid-sweep. QP-level
+        # parallelism is unaffected (--num-qp-per-transfer still applies).
+        if prepare_once and self.num_worker_threads > 1:
+            raise ValueError(
+                "--prepare-once requires --num-worker-threads 1 (the prepared path posts "
+                "inline from the calling thread; use --num-qp-per-transfer for QP parallelism)"
+            )
         self.prepare_once = prepare_once
         # Cache of prepared handles keyed by (buffer_size, transfer_batch_size).
         # Built lazily on first run_*_once for a size, reused across warmup+timed
