@@ -281,6 +281,75 @@ struct RdmaTransferControl {
   bool disableMerge{false};
 };
 
+// A single (possibly merged / chunked) RDMA work request plus its scatter-gather
+// list. Built once from a batch description and reused for posting. Defined here
+// (rather than privately in common.cpp) so it can be cached in a PreparedRdmaBatch.
+struct MergedWorkRequest {
+  ibv_send_wr wr{};
+  std::vector<ibv_sge> sges;
+  size_t totalRemoteLength = 0;
+  size_t mergedRequests = 1;
+};
+
+// Result of the "build" phase of a batch transfer: the fully merged/chunked WR
+// list with per-element addresses/lengths resolved, but WITHOUT the per-post
+// state (lkey/rkey, wr_id, signaling, next pointers). Reused across posts by
+// PostMergedWorkRequests, which re-arms that per-post state each time. This lets
+// callers hoist the sort/merge/chunk cost out of a hot transfer loop (the NIXL
+// createXferReq / postXferReq split), gated by the caller.
+struct PreparedRdmaBatch {
+  std::vector<MergedWorkRequest> mergedWrs;
+  size_t mergedWrCount{0};
+  size_t batchSize{0};  // original request count (callbackMeta totalBatchSize when !creditByWrCount)
+  RdmaTransferControl control{};
+  int postBatchSize{-1};
+  bool isRead{false};
+  bool valid{false};
+};
+
+// Build phase: produce the merged/chunked WR list for the given batch into the
+// caller-provided scratch pools. On success, `outWrs` points at whichever pool
+// holds the final list and `outCount` is its length. Used by both the original
+// RdmaBatchReadWrite (thread-local pools) and the prepared path (owned vectors).
+RdmaOpRet BuildMergedWorkRequests(const EpPairVec& eps,
+                                  const application::RdmaMemoryRegion& baseLocalMr,
+                                  const application::RdmaMemoryRegion& baseRemoteMr,
+                                  const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                  const SizeVec& sizes, bool isRead,
+                                  const RdmaTransferControl& control,
+                                  std::vector<size_t>& indices,
+                                  std::vector<MergedWorkRequest>& mergedPool,
+                                  std::vector<MergedWorkRequest>& chunkedPool,
+                                  std::vector<ChunkedSgeSegment>& chunkPlan,
+                                  std::vector<MergedWorkRequest>*& outWrs, size_t& outCount);
+
+// Post phase: re-arm per-post state (lkey/rkey, wr_id, signaling, next) on the
+// merged WR list and submit via ibv_post_send. Safe to call repeatedly on the
+// same `mergedWrs` (reset-on-post semantics), which is what the prepared path does.
+RdmaOpRet PostMergedWorkRequests(const EpPairVec& eps,
+                                 const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                                 const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                 std::vector<MergedWorkRequest>& mergedWrs, size_t mergedWrCount,
+                                 std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                                 int postBatchSize, const RdmaTransferControl& control);
+
+// Prepared-transfer helpers: build once, post many. BuildPreparedRdmaBatch runs
+// the build phase and stores the owned WR list in `out`. PostPreparedRdmaBatch
+// re-posts it. Both operate on the inline (non-executor) posting path.
+RdmaOpRet BuildPreparedRdmaBatch(const EpPairVec& eps,
+                                 const application::RdmaMemoryRegion& baseLocalMr,
+                                 const application::RdmaMemoryRegion& baseRemoteMr,
+                                 const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                 const SizeVec& sizes, bool isRead,
+                                 const RdmaTransferControl& control, int postBatchSize,
+                                 PreparedRdmaBatch& out);
+
+RdmaOpRet PostPreparedRdmaBatch(const EpPairVec& eps,
+                                const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                                const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                PreparedRdmaBatch& prepared,
+                                std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id);
+
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
                              const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,

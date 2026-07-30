@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -197,6 +198,8 @@ struct Args {
   bool batch_contiguous = false; // --batch-contiguous (adjacent offsets → merged WR);
                                  // default strided (each transfer a separate WR)
   bool enable_sess = false;      // --enable-sess (session fast-path); Python default: off
+  bool prepare_once = false;     // --prepare-once (build WRs once, re-post each iter; nixl-style
+                                 // createXferReq/postXferReq split). Requires --enable-sess.
 
   std::string mem_type = "gpu";  // --mem-type gpu|cpu
   std::string init_mem_type;     // --initiator-mem-type (empty => mem_type)
@@ -241,6 +244,8 @@ static Args ParseArgs(int argc, char** argv) {
     else if (k == "--batch-contiguous") a.batch_contiguous = true;
     else if (k == "--enable-sess") a.enable_sess = true;
     else if (k == "--disable-sess") a.enable_sess = false;
+    else if (k == "--prepare-once") a.prepare_once = true;
+    else if (k == "--no-prepare-once") a.prepare_once = false;
     else if (k == "--mem-type") a.mem_type = next();
     else if (k == "--initiator-mem-type") a.init_mem_type = next();
     else if (k == "--target-mem-type") a.target_mem_type = next();
@@ -376,6 +381,12 @@ int main(int argc, char** argv) {
   }
   const bool isRead = (a.op == "read");
 
+  if (a.prepare_once && !useSess) {
+    std::cerr << "--prepare-once requires --enable-sess (prepared handles live on a session)"
+              << std::endl;
+    std::exit(1);
+  }
+
   std::cout << "MsgSize(B)  Batch  Iters  AvgBW(GB/s)  AvgLat(us)  TotalDur(us)" << std::endl;
 
   for (auto& planEntry : plan) {
@@ -409,9 +420,47 @@ int main(int argc, char** argv) {
     MemDescVec locVec{localMem}, remVec{peerMem};
     BatchSizeVec offVec{offsets}, sizeVec{sizes};
 
+    // --prepare-once: build the merged/chunked WR list ONCE per (msg,batch) so
+    // the timed loop only re-posts it (nixl createXferReq / postXferReq split).
+    // Batched => a single N-descriptor handle; singles => one handle per
+    // transfer. Session-only (guarded above).
+    std::vector<std::shared_ptr<PreparedTransfer>> prepared;
+    if (a.prepare_once) {
+      auto build = [&](const SizeVec& lo, const SizeVec& ro, const SizeVec& sz) {
+        auto h = sessPtr->PrepareBatch(lo, ro, sz, isRead);
+        if (!h) {
+          std::cerr << "PrepareBatch failed (msg=" << msg << ", batch=" << curBatch << ")"
+                    << std::endl;
+          std::exit(1);
+        }
+        prepared.push_back(std::move(h));
+      };
+      if (batched) {
+        build(offsets, offsets, sizes);
+      } else {
+        for (int i = 0; i < curBatch; ++i) {
+          const size_t off = static_cast<size_t>(i) * msg;
+          build(SizeVec{off}, SizeVec{off}, SizeVec{msg});
+        }
+      }
+    }
+
     auto post = [&]() {
       TransferStatus* base = &st[0];
       for (int i = 0; i < perSlot; ++i) base[i].SetCode(StatusCode::INIT);
+      if (a.prepare_once) {
+        // Re-post the pre-built handle(s); no sort/merge/chunk on the hot path.
+        if (batched) {
+          TransferUniqueId id = sessPtr->AllocateTransferUniqueId();
+          sessPtr->PostPrepared(prepared[0], &base[0], id);
+        } else {
+          for (int i = 0; i < curBatch; ++i) {
+            TransferUniqueId id = sessPtr->AllocateTransferUniqueId();
+            sessPtr->PostPrepared(prepared[static_cast<size_t>(i)], &base[i], id);
+          }
+        }
+        return;
+      }
       if (batched) {
         // ONE N-descriptor batch request (nixl / Python --enable-batch-transfer).
         TransferUniqueId id =

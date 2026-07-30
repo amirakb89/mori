@@ -62,6 +62,17 @@ class IOEngineSession {
                  TransferStatus* status, TransferUniqueId id);
   void BatchWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets, const SizeVec& sizes,
                   TransferStatus* status, TransferUniqueId id);
+
+  // Prepared (build-once, post-many) transfer API. PrepareBatch builds the work
+  // requests once and returns a reusable handle (nullptr if the backend does not
+  // support it); PostPrepared re-posts it with a fresh status/id. Offsets/sizes
+  // are captured at prepare time and must not change between posts.
+  std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
+                                                 const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                                 bool isRead);
+  void PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared, TransferStatus* status,
+                    TransferUniqueId id);
+
   bool Alive();
 
   friend class IOEngine;

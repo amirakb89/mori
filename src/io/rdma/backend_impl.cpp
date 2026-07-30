@@ -1443,6 +1443,72 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 }
 
+// Concrete prepared-transfer handle for the RDMA backend: owns the built
+// (sorted/merged/chunked) work-request list so PostPrepared can re-post it.
+struct RdmaPreparedTransfer : public PreparedTransfer {
+  PreparedRdmaBatch batch;
+};
+
+std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec& localOffsets,
+                                                                   const SizeVec& remoteOffsets,
+                                                                   const SizeVec& sizes,
+                                                                   bool isRead) {
+  MORI_IO_FUNCTION_TIMER;
+  if (eps.empty() || localMrPerEp.empty() || remoteMrPerEp.empty()) {
+    MORI_IO_WARN("PrepareBatch: session has no endpoints/memory regions");
+    return nullptr;
+  }
+  // The prepared path uses the inline (non-executor) posting route, mirroring
+  // the RdmaBatchReadWrite `else` branch control setup.
+  const bool chunk = config.enableTransferChunking;
+  RdmaTransferControl control{};
+  control.chunkBytes = chunk ? config.chunkBytes : 0;
+  control.maxChunks = config.maxChunksPerTransfer;
+  control.creditByWrCount = chunk;
+
+  auto handle = std::make_shared<RdmaPreparedTransfer>();
+  RdmaOpRet ret =
+      BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(), localOffsets,
+                             remoteOffsets, sizes, isRead, control, config.postBatchSize,
+                             handle->batch);
+  if (ret.Failed()) {
+    MORI_IO_WARN("PrepareBatch failed to build work requests: {}", ret.message);
+    return nullptr;
+  }
+  return handle;
+}
+
+void RdmaBackendSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared,
+                                      TransferStatus* status, TransferUniqueId id) {
+  MORI_IO_FUNCTION_TIMER;
+  status->SetCode(StatusCode::IN_PROGRESS);
+
+  auto* handle = dynamic_cast<RdmaPreparedTransfer*>(prepared.get());
+  if (handle == nullptr || !handle->batch.valid) {
+    status->Update(StatusCode::ERR_INVALID_ARGS, "invalid prepared transfer handle");
+    return;
+  }
+
+  // When !creditByWrCount, totalBatchSize is the original request count; the
+  // chunked path overwrites it inside PostMergedWorkRequests (ownsTotalBatchSize).
+  const int totalCredit = static_cast<int>(handle->batch.batchSize);
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+
+  RdmaOpRet ret =
+      PostPreparedRdmaBatch(eps, localMrPerEp, remoteMrPerEp, handle->batch, callbackMeta, id);
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    status->Update(ret.code, ret.message);
+  }
+  if (!ret.Failed() && config.enableNotification) {
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) {
+      status->Update(notifRet.code, notifRet.message);
+    }
+  }
+}
+
 bool RdmaBackendSession::Alive() const { return true; }
 
 /* ----------------------------------------------------------------------------------------------

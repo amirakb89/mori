@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -115,6 +116,19 @@ inline std::ostream& operator<<(std::ostream& os, const FabricBackendConfig& c) 
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                        PreparedTransfer                                        */
+/* ---------------------------------------------------------------------------------------------- */
+// Opaque, backend-owned handle for a transfer whose work requests were built
+// once (sort/merge/chunk) and can be re-posted many times. Lets callers hoist
+// the descriptor-build cost out of a hot transfer loop (the NIXL
+// createXferReq/postXferReq split). Backends that do not support prepared
+// transfers simply return nullptr from PrepareBatch.
+struct PreparedTransfer {
+  PreparedTransfer() = default;
+  virtual ~PreparedTransfer() = default;
+};
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                         BackendSession                                         */
 /* ---------------------------------------------------------------------------------------------- */
 class BackendSession {
@@ -144,6 +158,22 @@ class BackendSession {
                         const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
     BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, true);
   }
+
+  // Prepared (build-once, post-many) transfer API. PrepareBatch builds the work
+  // requests for the given batch and returns a reusable handle; PostPrepared
+  // submits it with a fresh status/id. The default implementation returns
+  // nullptr / reports unsupported, so backends may opt in. Offsets/sizes are
+  // captured at prepare time and must not change between posts.
+  virtual std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
+                                                         const SizeVec& remoteOffsets,
+                                                         const SizeVec& sizes, bool isRead) {
+    return nullptr;
+  }
+  virtual void PostPrepared(const std::shared_ptr<PreparedTransfer>& prepared,
+                            TransferStatus* status, TransferUniqueId id) {
+    status->Update(StatusCode::ERR_BAD_STATE, "prepared transfer not supported by this backend");
+  }
+
   virtual bool Alive() const = 0;
 };
 
