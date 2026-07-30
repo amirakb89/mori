@@ -530,13 +530,6 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
   }
 }
 
-struct MergedWorkRequest {
-  ibv_send_wr wr{};
-  std::vector<ibv_sge> sges;
-  size_t totalRemoteLength = 0;
-  size_t mergedRequests = 1;
-};
-
 static void ResetMergedWorkRequestPointers(MergedWorkRequest* wr) {
   if (wr == nullptr) return;
   wr->wr.sg_list = wr->sges.empty() ? nullptr : wr->sges.data();
@@ -598,14 +591,19 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   return {StatusCode::IN_PROGRESS, ""};
 }
 
-RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
-                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
-                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
-                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
-                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
-                             TransferUniqueId id, bool isRead, int postBatchSize,
-                             const RdmaTransferControl& control) {
-  MORI_IO_FUNCTION_TIMER;
+RdmaOpRet BuildMergedWorkRequests(const EpPairVec& eps,
+                                  const application::RdmaMemoryRegion& baseLocalMr,
+                                  const application::RdmaMemoryRegion& baseRemoteMr,
+                                  const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                  const SizeVec& sizes, bool isRead,
+                                  const RdmaTransferControl& control,
+                                  std::vector<size_t>& indices,
+                                  std::vector<MergedWorkRequest>& mergedPool,
+                                  std::vector<MergedWorkRequest>& chunkedPool,
+                                  std::vector<ChunkedSgeSegment>& chunkPlan,
+                                  std::vector<MergedWorkRequest>*& outWrs, size_t& outCount) {
+  outWrs = &mergedPool;
+  outCount = 0;
 
   if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
     return {StatusCode::ERR_INVALID_ARGS,
@@ -621,16 +619,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
   }
 
-  if (localMrPerEp.size() != eps.size() || remoteMrPerEp.size() != eps.size()) {
-    return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
-  }
-
   if (control.maxChunks <= 0) {
     return {StatusCode::ERR_INVALID_ARGS, "maxChunks must be >= 1"};
   }
 
-  const application::RdmaMemoryRegion& baseLocalMr = localMrPerEp.front();
-  const application::RdmaMemoryRegion& baseRemoteMr = remoteMrPerEp.front();
   for (size_t i = 0; i < batchSize; i++) {
     if (sizes[i] > std::numeric_limits<uint32_t>::max()) {
       return {StatusCode::ERR_INVALID_ARGS, "single request size " + std::to_string(sizes[i]) +
@@ -639,57 +631,6 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     if (((localOffsets[i] + sizes[i]) > baseLocalMr.length) ||
         ((remoteOffsets[i] + sizes[i]) > baseRemoteMr.length)) {
       return {StatusCode::ERR_INVALID_ARGS, "length out of range"};
-    }
-  }
-
-  // [tls-scratch] Per worker-thread scratch pools eliminate per-batch heap
-  // allocations on the RDMA hot path (slot reuse / resize() / clear() retain
-  // capacity across calls). The pools belong to the OUTERMOST call on a thread;
-  // if RdmaBatchReadWrite is ever re-entered on the same thread (e.g. from a
-  // completion callback), the nested call transparently falls back to local
-  // buffers so the outer call's pools are never clobbered.
-  thread_local std::vector<size_t> tlIndices;
-  thread_local std::vector<MergedWorkRequest> tlMergedPool;
-  thread_local std::vector<MergedWorkRequest> tlChunkedPool;
-  thread_local std::vector<ChunkedSgeSegment> tlChunkPlan;
-  thread_local std::vector<int> tlEpWrsSinceSignal;
-  thread_local std::vector<size_t> tlEpMergedSinceSignal;
-  thread_local int reentryDepth = 0;
-
-  struct ReentryGuard {
-    int& depth;
-    explicit ReentryGuard(int& d) : depth(d) { ++depth; }
-    ~ReentryGuard() { --depth; }
-  } reentryGuard(reentryDepth);
-  const bool usePool = (reentryDepth == 1);
-
-  // Used only on (currently non-existent) same-thread re-entry.
-  std::vector<size_t> localIndices;
-  std::vector<MergedWorkRequest> localMergedPool;
-  std::vector<MergedWorkRequest> localChunkedPool;
-  std::vector<ChunkedSgeSegment> localChunkPlan;
-  std::vector<int> localEpWrsSinceSignal;
-  std::vector<size_t> localEpMergedSinceSignal;
-
-  std::vector<size_t>& indices = usePool ? tlIndices : localIndices;
-  std::vector<MergedWorkRequest>& mergedPool = usePool ? tlMergedPool : localMergedPool;
-  std::vector<MergedWorkRequest>& chunkedPool = usePool ? tlChunkedPool : localChunkedPool;
-  std::vector<ChunkedSgeSegment>& chunkPlan = usePool ? tlChunkPlan : localChunkPlan;
-  std::vector<int>& epWrsSinceSignal = usePool ? tlEpWrsSinceSignal : localEpWrsSinceSignal;
-  std::vector<size_t>& epMergedSinceSignal =
-      usePool ? tlEpMergedSinceSignal : localEpMergedSinceSignal;
-
-  // Bound peak retained memory: if an earlier very large batch grew the pools far
-  // beyond the current need, release the excess so it doesn't stay resident.
-  constexpr size_t kPoolHighWater = 8192;
-  if (usePool && batchSize <= kPoolHighWater / 2) {
-    if (mergedPool.size() > kPoolHighWater) {
-      mergedPool.resize(kPoolHighWater);
-      mergedPool.shrink_to_fit();
-    }
-    if (chunkedPool.size() > kPoolHighWater) {
-      chunkedPool.resize(kPoolHighWater);
-      chunkedPool.shrink_to_fit();
     }
   }
 
@@ -849,9 +790,17 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
   }
 
-  std::vector<MergedWorkRequest>& mergedWrs = useChunked ? chunkedPool : mergedPool;
-  size_t mergedWrCount = useChunked ? chunkedCount : wrCount;
+  outWrs = useChunked ? &chunkedPool : &mergedPool;
+  outCount = useChunked ? chunkedCount : wrCount;
+  return {StatusCode::SUCCESS, ""};
+}
 
+RdmaOpRet PostMergedWorkRequests(const EpPairVec& eps,
+                                 const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                                 const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                 std::vector<MergedWorkRequest>& mergedWrs, size_t mergedWrCount,
+                                 std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id,
+                                 int postBatchSize, const RdmaTransferControl& control) {
   if (control.creditByWrCount) {
     if (mergedWrCount > static_cast<size_t>(std::numeric_limits<int>::max())) {
       return {StatusCode::ERR_INVALID_ARGS, "final WR count exceeds int range"};
@@ -881,8 +830,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  epWrsSinceSignal.assign(epNum, 0);
-  epMergedSinceSignal.assign(epNum, 0);
+  // Per-call scratch (was thread-local in the monolithic path; these are only
+  // valid for the duration of a single post and are reset here each call).
+  std::vector<int> epWrsSinceSignal(epNum, 0);
+  std::vector<size_t> epMergedSinceSignal(epNum, 0);
 
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
@@ -913,6 +864,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
       struct ibv_send_wr& wr = mergedWr.wr;
       wr.wr_id = 0;
+      // Reset signaling every post: a WR reused across posts (prepared path) may
+      // have been the signaled tail of a previous post; only the tail selected
+      // below should carry IBV_SEND_SIGNALED. No-op for the fresh-build path.
+      wr.send_flags = 0;
       wr.next = (j + 1 < end) ? &mergedWrs[j + 1].wr : nullptr;
       mergedReqSize += mergedWr.mergedRequests;
     }
@@ -1026,6 +981,139 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
   return {StatusCode::IN_PROGRESS, ""};
+}
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize,
+                             const RdmaTransferControl& control) {
+  MORI_IO_FUNCTION_TIMER;
+
+  if (sizes.size() == 0 && localOffsets.size() == 0 && remoteOffsets.size() == 0) {
+    return {StatusCode::SUCCESS, ""};
+  }
+
+  if (eps.empty()) {
+    return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+  }
+
+  if (localMrPerEp.size() != eps.size() || remoteMrPerEp.size() != eps.size()) {
+    return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
+  }
+
+  // [tls-scratch] Per worker-thread scratch pools eliminate per-batch heap
+  // allocations on the RDMA hot path (slot reuse / resize() / clear() retain
+  // capacity across calls). The pools belong to the OUTERMOST call on a thread;
+  // if RdmaBatchReadWrite is ever re-entered on the same thread (e.g. from a
+  // completion callback), the nested call transparently falls back to local
+  // buffers so the outer call's pools are never clobbered.
+  thread_local std::vector<size_t> tlIndices;
+  thread_local std::vector<MergedWorkRequest> tlMergedPool;
+  thread_local std::vector<MergedWorkRequest> tlChunkedPool;
+  thread_local std::vector<ChunkedSgeSegment> tlChunkPlan;
+  thread_local int reentryDepth = 0;
+
+  struct ReentryGuard {
+    int& depth;
+    explicit ReentryGuard(int& d) : depth(d) { ++depth; }
+    ~ReentryGuard() { --depth; }
+  } reentryGuard(reentryDepth);
+  const bool usePool = (reentryDepth == 1);
+
+  // Used only on (currently non-existent) same-thread re-entry.
+  std::vector<size_t> localIndices;
+  std::vector<MergedWorkRequest> localMergedPool;
+  std::vector<MergedWorkRequest> localChunkedPool;
+  std::vector<ChunkedSgeSegment> localChunkPlan;
+
+  std::vector<size_t>& indices = usePool ? tlIndices : localIndices;
+  std::vector<MergedWorkRequest>& mergedPool = usePool ? tlMergedPool : localMergedPool;
+  std::vector<MergedWorkRequest>& chunkedPool = usePool ? tlChunkedPool : localChunkedPool;
+  std::vector<ChunkedSgeSegment>& chunkPlan = usePool ? tlChunkPlan : localChunkPlan;
+
+  // Bound peak retained memory: if an earlier very large batch grew the pools far
+  // beyond the current need, release the excess so it doesn't stay resident.
+  constexpr size_t kPoolHighWater = 8192;
+  if (usePool && sizes.size() <= kPoolHighWater / 2) {
+    if (mergedPool.size() > kPoolHighWater) {
+      mergedPool.resize(kPoolHighWater);
+      mergedPool.shrink_to_fit();
+    }
+    if (chunkedPool.size() > kPoolHighWater) {
+      chunkedPool.resize(kPoolHighWater);
+      chunkedPool.shrink_to_fit();
+    }
+  }
+
+  const application::RdmaMemoryRegion& baseLocalMr = localMrPerEp.front();
+  const application::RdmaMemoryRegion& baseRemoteMr = remoteMrPerEp.front();
+
+  std::vector<MergedWorkRequest>* mergedWrs = nullptr;
+  size_t mergedWrCount = 0;
+  RdmaOpRet buildRet =
+      BuildMergedWorkRequests(eps, baseLocalMr, baseRemoteMr, localOffsets, remoteOffsets, sizes,
+                              isRead, control, indices, mergedPool, chunkedPool, chunkPlan,
+                              mergedWrs, mergedWrCount);
+  if (buildRet.Failed()) return buildRet;
+  if (mergedWrCount == 0) return {StatusCode::SUCCESS, ""};
+
+  return PostMergedWorkRequests(eps, localMrPerEp, remoteMrPerEp, *mergedWrs, mergedWrCount,
+                                callbackMeta, id, postBatchSize, control);
+}
+
+RdmaOpRet BuildPreparedRdmaBatch(const EpPairVec& eps,
+                                 const application::RdmaMemoryRegion& baseLocalMr,
+                                 const application::RdmaMemoryRegion& baseRemoteMr,
+                                 const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                                 const SizeVec& sizes, bool isRead,
+                                 const RdmaTransferControl& control, int postBatchSize,
+                                 PreparedRdmaBatch& out) {
+  out.valid = false;
+  std::vector<size_t> indices;
+  std::vector<MergedWorkRequest> mergedPool;
+  std::vector<MergedWorkRequest> chunkedPool;
+  std::vector<ChunkedSgeSegment> chunkPlan;
+  std::vector<MergedWorkRequest>* outWrs = nullptr;
+  size_t outCount = 0;
+
+  RdmaOpRet ret =
+      BuildMergedWorkRequests(eps, baseLocalMr, baseRemoteMr, localOffsets, remoteOffsets, sizes,
+                              isRead, control, indices, mergedPool, chunkedPool, chunkPlan, outWrs,
+                              outCount);
+  if (ret.Failed()) return ret;
+
+  // Own the built WR list (moving preserves each WR's sges buffer; sg_list is
+  // re-armed on every post via ResetMergedWorkRequestPointers).
+  out.mergedWrs = std::move(*outWrs);
+  out.mergedWrs.resize(outCount);
+  out.mergedWrCount = outCount;
+  out.batchSize = sizes.size();
+  out.control = control;
+  out.postBatchSize = postBatchSize;
+  out.isRead = isRead;
+  out.valid = true;
+  return {StatusCode::SUCCESS, ""};
+}
+
+RdmaOpRet PostPreparedRdmaBatch(const EpPairVec& eps,
+                                const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                                const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                                PreparedRdmaBatch& prepared,
+                                std::shared_ptr<CqCallbackMeta> callbackMeta, TransferUniqueId id) {
+  if (!prepared.valid) {
+    return {StatusCode::ERR_BAD_STATE, "prepared RDMA batch is not valid"};
+  }
+  if (localMrPerEp.size() != eps.size() || remoteMrPerEp.size() != eps.size()) {
+    return {StatusCode::ERR_INVALID_ARGS, "memory-region vectors must align with endpoints"};
+  }
+  if (prepared.mergedWrCount == 0) return {StatusCode::SUCCESS, ""};
+
+  return PostMergedWorkRequests(eps, localMrPerEp, remoteMrPerEp, prepared.mergedWrs,
+                                prepared.mergedWrCount, callbackMeta, id, prepared.postBatchSize,
+                                prepared.control);
 }
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
