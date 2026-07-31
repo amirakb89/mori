@@ -596,8 +596,7 @@ RdmaOpRet BuildMergedWorkRequests(const EpPairVec& eps,
                                   const application::RdmaMemoryRegion& baseRemoteMr,
                                   const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                   const SizeVec& sizes, bool isRead,
-                                  const RdmaTransferControl& control,
-                                  std::vector<size_t>& indices,
+                                  const RdmaTransferControl& control, std::vector<size_t>& indices,
                                   std::vector<MergedWorkRequest>& mergedPool,
                                   std::vector<MergedWorkRequest>& chunkedPool,
                                   std::vector<ChunkedSgeSegment>& chunkPlan,
@@ -830,10 +829,30 @@ RdmaOpRet PostMergedWorkRequests(const EpPairVec& eps,
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  // Per-call scratch (was thread-local in the monolithic path; these are only
-  // valid for the duration of a single post and are reset here each call).
-  std::vector<int> epWrsSinceSignal(epNum, 0);
-  std::vector<size_t> epMergedSinceSignal(epNum, 0);
+  // [tls-scratch] These counters are only meaningful for the duration of one
+  // post, but keeping them thread-local retains capacity across posts instead of
+  // heap-allocating twice per transfer on the RDMA hot path. As in
+  // RdmaBatchReadWrite, the pools belong to the OUTERMOST call on a thread; a
+  // nested post (e.g. from a completion callback reached via the failure path
+  // below) falls back to local vectors so the outer call's counters survive.
+  thread_local std::vector<int> tlEpWrsSinceSignal;
+  thread_local std::vector<size_t> tlEpMergedSinceSignal;
+  thread_local int postReentryDepth = 0;
+
+  struct PostReentryGuard {
+    int& depth;
+    explicit PostReentryGuard(int& d) : depth(d) { ++depth; }
+    ~PostReentryGuard() { --depth; }
+  } postReentryGuard(postReentryDepth);
+  const bool usePool = (postReentryDepth == 1);
+
+  std::vector<int> localEpWrsSinceSignal;
+  std::vector<size_t> localEpMergedSinceSignal;
+  std::vector<int>& epWrsSinceSignal = usePool ? tlEpWrsSinceSignal : localEpWrsSinceSignal;
+  std::vector<size_t>& epMergedSinceSignal =
+      usePool ? tlEpMergedSinceSignal : localEpMergedSinceSignal;
+  epWrsSinceSignal.assign(epNum, 0);
+  epMergedSinceSignal.assign(epNum, 0);
 
   // Rotate the starting EP by transfer id so single-segment (single WR)
   // transfers spread evenly across all QPs instead of always landing on eps[0].
@@ -1053,10 +1072,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
   std::vector<MergedWorkRequest>* mergedWrs = nullptr;
   size_t mergedWrCount = 0;
-  RdmaOpRet buildRet =
-      BuildMergedWorkRequests(eps, baseLocalMr, baseRemoteMr, localOffsets, remoteOffsets, sizes,
-                              isRead, control, indices, mergedPool, chunkedPool, chunkPlan,
-                              mergedWrs, mergedWrCount);
+  RdmaOpRet buildRet = BuildMergedWorkRequests(
+      eps, baseLocalMr, baseRemoteMr, localOffsets, remoteOffsets, sizes, isRead, control, indices,
+      mergedPool, chunkedPool, chunkPlan, mergedWrs, mergedWrCount);
   if (buildRet.Failed()) return buildRet;
   if (mergedWrCount == 0) return {StatusCode::SUCCESS, ""};
 
@@ -1079,10 +1097,9 @@ RdmaOpRet BuildPreparedRdmaBatch(const EpPairVec& eps,
   std::vector<MergedWorkRequest>* outWrs = nullptr;
   size_t outCount = 0;
 
-  RdmaOpRet ret =
-      BuildMergedWorkRequests(eps, baseLocalMr, baseRemoteMr, localOffsets, remoteOffsets, sizes,
-                              isRead, control, indices, mergedPool, chunkedPool, chunkPlan, outWrs,
-                              outCount);
+  RdmaOpRet ret = BuildMergedWorkRequests(eps, baseLocalMr, baseRemoteMr, localOffsets,
+                                          remoteOffsets, sizes, isRead, control, indices,
+                                          mergedPool, chunkedPool, chunkPlan, outWrs, outCount);
   if (ret.Failed()) return ret;
 
   // Own the built WR list (moving preserves each WR's sges buffer; sg_list is

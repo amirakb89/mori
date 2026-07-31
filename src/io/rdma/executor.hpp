@@ -26,6 +26,8 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <utility>
+#include <vector>
 
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/io/common.hpp"
@@ -52,6 +54,24 @@ struct ExecutorReq {
   int maxChunks{1};
 };
 
+// Prepared (build-once, post-many) counterpart of ExecutorReq. PrepareBatch has
+// already split the batch into one self-contained single-endpoint WR list per
+// slice, so a worker only re-arms and posts its own slice: slices share no mutable
+// state, and the endpoint a slice lands on is chosen per post by the caller.
+struct ExecutorPreparedReq {
+  const EpPairVec& eps;
+  const application::RdmaMemoryRegion& local;
+  const application::RdmaMemoryRegion& remote;
+  std::vector<PreparedRdmaBatch>& slices;
+  std::shared_ptr<CqCallbackMeta> callbackMeta;
+  TransferUniqueId id;
+};
+
+// Split `totalBatchSize` descriptors into at most min(numEps, numWorker) contiguous
+// [begin, end) slices. Shared by the build-and-post path and the prepared path so
+// that both decompose a batch identically at a given worker count.
+std::vector<std::pair<int, int>> SplitBatchWork(int numEps, int numWorker, int totalBatchSize);
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Executor                                            */
 /* ---------------------------------------------------------------------------------------------- */
@@ -63,6 +83,10 @@ class Executor {
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
   virtual RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req) = 0;
+  virtual RdmaOpRet PostPrepared(const ExecutorPreparedReq& req) = 0;
+  // Number of worker threads actually available, which PrepareBatch needs to
+  // decide how many slices to build.
+  virtual int NumWorkers() const = 0;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -74,22 +98,31 @@ class MultithreadExecutor : public Executor {
   ~MultithreadExecutor();
 
   RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req);
+  RdmaOpRet PostPrepared(const ExecutorPreparedReq& req);
+  int NumWorkers() const { return numWorker; }
   void Start();
   void Shutdown();
 
  private:
   struct Task {
-    const ExecutorReq* req;
+    // Exactly one of `req` (build a descriptor range, then post it) or `preq`
+    // (post an already-built slice) is set.
+    const ExecutorReq* req{nullptr};
+    const ExecutorPreparedReq* preq{nullptr};
     int epId{-1};
     int begin{-1};
     int end{-1};
+    int sliceId{-1};
     std::promise<RdmaOpRet> ret;
 
     Task(const ExecutorReq* req_, int epId_, int begin_, int end_)
         : req(req_), epId(epId_), begin(begin_), end(end_) {}
+    Task(const ExecutorPreparedReq* preq_, int epId_, int sliceId_)
+        : preq(preq_), epId(epId_), sliceId(sliceId_) {}
   };
 
   std::vector<std::pair<int, int>> SplitWork(const ExecutorReq& req);
+  static RdmaOpRet AggregateResults(std::vector<std::future<RdmaOpRet>>& futs);
 
   class Worker {
    public:

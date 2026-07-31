@@ -1452,10 +1452,18 @@ struct RdmaPreparedTransfer : public PreparedTransfer {
   // Posting through another session would combine those addresses with a
   // different session's QPs/MRs and is therefore invalid.
   const RdmaBackendSession* const owner;
+  // Inline posting: one WR list spanning every endpoint in the session, which the
+  // post phase distributes across them. Empty when posting through workers.
   PreparedRdmaBatch batch;
-  // Each post re-arms the shared WR list in place (lkey/rkey, wr_id, send_flags,
-  // next chain). Serialize posts of the SAME handle so concurrent callers can't
-  // corrupt that chain; distinct handles stay fully parallel.
+  // Worker-pool posting: one self-contained single-endpoint WR list per slice, so
+  // workers re-arm and post disjoint state. Empty when posting inline.
+  std::vector<PreparedRdmaBatch> slices;
+  // Completion credit for the whole handle, fixed at build time. Used by the
+  // sliced path, where no single slice owns callbackMeta's total.
+  int totalCredit{0};
+  // Each post re-arms the WR list in place (lkey/rkey, wr_id, send_flags, next
+  // chain). Serialize posts of the SAME handle so concurrent callers can't corrupt
+  // it; distinct handles stay fully parallel.
   std::mutex postMu;
 };
 
@@ -1468,30 +1476,69 @@ std::shared_ptr<PreparedTransfer> RdmaBackendSession::PrepareBatch(const SizeVec
     MORI_IO_WARN("PrepareBatch: session has no endpoints/memory regions");
     return nullptr;
   }
-  // The prepared path always posts inline from the calling thread, so it would
-  // silently ignore the worker pool that BatchReadWrite uses. Rather than report
-  // numbers for a posting model the caller did not ask for, refuse up front.
-  // Prepared transfers still use every QP in the session (qpPerTransfer); only
-  // multi-threaded submission is unavailable.
-  if (executor != nullptr) {
-    MORI_IO_WARN(
-        "PrepareBatch is unsupported with numWorkerThreads>1: the prepared path posts inline "
-        "from the calling thread and would bypass the worker pool. Set numWorkerThreads=1 "
-        "(qpPerTransfer is unaffected) to use prepared transfers.");
-    return nullptr;
-  }
-  // Control setup mirrors the RdmaBatchReadWrite `else` (inline) branch.
+  // Which posting model this handle is built for mirrors BatchReadWrite's executor
+  // gating, so prepared and non-prepared transfers decompose a batch identically at
+  // a given worker count: chunked worker posting requires GPU local memory, and
+  // without chunking any session that has an executor qualifies.
   const bool chunk = config.enableTransferChunking;
+  const bool useWorkerChunking =
+      executor != nullptr && chunk && localLoc_ == MemoryLocationType::GPU;
+  const bool useWorkers = executor != nullptr && (useWorkerChunking || !chunk);
+
+  auto handle = std::make_shared<RdmaPreparedTransfer>(this);
+
+  if (useWorkers) {
+    // Control setup mirrors what an executor worker applies per task.
+    RdmaTransferControl control{};
+    control.chunkBytes = useWorkerChunking ? config.chunkBytes : 0;
+    control.maxChunks = useWorkerChunking ? config.maxChunksPerTransfer : 1;
+    control.creditByWrCount = useWorkerChunking;
+    control.disableMerge = useWorkerChunking;
+    // The handle owns the completion total; a slice only knows its own share.
+    control.ownsTotalBatchSize = false;
+
+    const auto splits = SplitBatchWork(static_cast<int>(eps.size()), executor->NumWorkers(),
+                                       static_cast<int>(sizes.size()));
+    handle->slices.resize(splits.size());
+    size_t credit = 0;
+    for (size_t i = 0; i < splits.size(); ++i) {
+      const size_t begin = static_cast<size_t>(splits[i].first);
+      const size_t end = static_cast<size_t>(splits[i].second);
+      SizeVec sliceLocalOffsets(localOffsets.begin() + begin, localOffsets.begin() + end);
+      SizeVec sliceRemoteOffsets(remoteOffsets.begin() + begin, remoteOffsets.begin() + end);
+      SizeVec sliceSizes(sizes.begin() + begin, sizes.begin() + end);
+
+      // Built against the whole endpoint set so the SGE and message-size bounds are
+      // the minimum across endpoints; that is what keeps a slice postable on any of
+      // them, and lets PostPrepared rotate slices across QPs per transfer id.
+      RdmaOpRet ret = BuildPreparedRdmaBatch(
+          eps, localMrPerEp.front(), remoteMrPerEp.front(), sliceLocalOffsets, sliceRemoteOffsets,
+          sliceSizes, isRead, control, config.postBatchSize, handle->slices[i]);
+      if (ret.Failed()) {
+        MORI_IO_WARN("PrepareBatch failed to build work requests: {}", ret.message);
+        return nullptr;
+      }
+      // Credit matches what the CQ path will award: one per WR when crediting by WR
+      // count, otherwise one per original descriptor.
+      credit += useWorkerChunking ? handle->slices[i].mergedWrCount : handle->slices[i].batchSize;
+    }
+    if (credit > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      MORI_IO_WARN("PrepareBatch: completion credit {} exceeds int range", credit);
+      return nullptr;
+    }
+    handle->totalCredit = static_cast<int>(credit);
+    return handle;
+  }
+
+  // Control setup mirrors the RdmaBatchReadWrite `else` (inline) branch.
   RdmaTransferControl control{};
   control.chunkBytes = chunk ? config.chunkBytes : 0;
   control.maxChunks = config.maxChunksPerTransfer;
   control.creditByWrCount = chunk;
 
-  auto handle = std::make_shared<RdmaPreparedTransfer>(this);
-  RdmaOpRet ret =
-      BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(), localOffsets,
-                             remoteOffsets, sizes, isRead, control, config.postBatchSize,
-                             handle->batch);
+  RdmaOpRet ret = BuildPreparedRdmaBatch(eps, localMrPerEp.front(), remoteMrPerEp.front(),
+                                         localOffsets, remoteOffsets, sizes, isRead, control,
+                                         config.postBatchSize, handle->batch);
   if (ret.Failed()) {
     MORI_IO_WARN("PrepareBatch failed to build work requests: {}", ret.message);
     return nullptr;
@@ -1505,7 +1552,8 @@ void RdmaBackendSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& p
   status->SetCode(StatusCode::IN_PROGRESS);
 
   auto* handle = dynamic_cast<RdmaPreparedTransfer*>(prepared.get());
-  if (handle == nullptr || !handle->batch.valid) {
+  const bool sliced = handle != nullptr && !handle->slices.empty();
+  if (handle == nullptr || (!sliced && !handle->batch.valid)) {
     status->Update(StatusCode::ERR_INVALID_ARGS, "invalid prepared transfer handle");
     return;
   }
@@ -1515,16 +1563,24 @@ void RdmaBackendSession::PostPrepared(const std::shared_ptr<PreparedTransfer>& p
     return;
   }
 
-  // When !creditByWrCount, totalBatchSize is the original request count; the
-  // chunked path overwrites it inside PostMergedWorkRequests (ownsTotalBatchSize).
-  const int totalCredit = static_cast<int>(handle->batch.batchSize);
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
-  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
-
-  // Guard the in-place re-arm + ibv_post_send of the shared WR list so two
-  // threads posting the same handle can't interleave and corrupt the chain.
+  // Guard the in-place re-arm + ibv_post_send of the WR list(s) so two threads
+  // posting the same handle can't interleave and corrupt them. Within one post the
+  // slices are disjoint, so workers need no further synchronization.
   RdmaOpRet ret;
-  {
+  if (sliced) {
+    auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, handle->totalCredit);
+    internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+    ExecutorPreparedReq req{
+        eps, localMrPerEp.front(), remoteMrPerEp.front(), handle->slices, callbackMeta, id};
+    std::lock_guard<std::mutex> postLock(handle->postMu);
+    ret = executor->PostPrepared(req);
+  } else {
+    // When !creditByWrCount, totalBatchSize is the original request count; the
+    // chunked path overwrites it inside PostMergedWorkRequests (ownsTotalBatchSize).
+    const int totalCredit = static_cast<int>(handle->batch.batchSize);
+    auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
+    internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+
     std::lock_guard<std::mutex> postLock(handle->postMu);
     ret = PostPreparedRdmaBatch(eps, localMrPerEp, remoteMrPerEp, handle->batch, callbackMeta, id);
   }

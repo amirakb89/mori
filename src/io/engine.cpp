@@ -161,8 +161,8 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
 }
 
 std::shared_ptr<PreparedTransfer> IOEngineSession::PrepareBatch(const SizeVec& localOffsets,
-                                                               const SizeVec& remoteOffsets,
-                                                               const SizeVec& sizes, bool isRead) {
+                                                                const SizeVec& remoteOffsets,
+                                                                const SizeVec& sizes, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   return backendSess->PrepareBatch(localOffsets, remoteOffsets, sizes, isRead);
 }

@@ -118,11 +118,6 @@ inline std::ostream& operator<<(std::ostream& os, const FabricBackendConfig& c) 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        PreparedTransfer                                        */
 /* ---------------------------------------------------------------------------------------------- */
-// Opaque, backend-owned handle for a transfer whose work requests were built
-// once (sort/merge/chunk) and can be re-posted many times. Lets callers hoist
-// the descriptor-build cost out of a hot transfer loop (the NIXL
-// createXferReq/postXferReq split). Backends that do not support prepared
-// transfers simply return nullptr from PrepareBatch.
 struct PreparedTransfer {
   PreparedTransfer() = default;
   virtual ~PreparedTransfer() = default;
@@ -159,17 +154,7 @@ class BackendSession {
     BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, true);
   }
 
-  // Prepared (build-once, post-many) transfer API. PrepareBatch builds the work
-  // requests for the given batch and returns a reusable handle; PostPrepared
-  // submits it with a fresh status/id. The default implementation returns
-  // nullptr / reports unsupported, so backends may opt in. Offsets/sizes are
-  // captured at prepare time and must not change between posts.
-  //
-  // A handle is bound to the session that created it and may only be posted
-  // through that session. Posting is submitted from the calling thread, so a
-  // backend configured with an internal worker pool may decline to prepare
-  // (returns nullptr) rather than silently bypass it; callers must treat a null
-  // handle as "use the regular batch path".
+  // Prepared (build-once, post-many) transfer API.
   virtual std::shared_ptr<PreparedTransfer> PrepareBatch(const SizeVec& localOffsets,
                                                          const SizeVec& remoteOffsets,
                                                          const SizeVec& sizes, bool isRead) {

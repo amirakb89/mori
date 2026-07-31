@@ -146,10 +146,20 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 | `--enable-batch-transfer` (default OFF) | `--enable-batch-transfer` / `--disable-batch-transfer` (C++ default **ON**) | Same meaning as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). The C++ tool defaults **ON** so the out-of-the-box run and `--all-batch` sweep are nixl-comparable; pass `--disable-batch-transfer` for the Python single-submission path. |
 | *(n/a)* | `--warmup-iters` / `--iters` | Explicit warmup (untimed) and timed iteration counts. |
 | `--sweep-start-size` / `--sweep-max-size` | `--sweep-start` / `--sweep-max` (aliases accepted) | Plus `--sweep-step` for a linear (vs geometric) sweep. |
+| `--backend rdma\|xgmi\|fabric` | `--backend rdma\|xgmi` | C++ has no `fabric` path. `--num-streams` / `--num-events` size the XGMI HIP pools, as in Python. |
+| *(n/a)* | `--prepare-once` | Prepared (build-once, post-many) transfers are exercised **only** by the C++ tool; the Python benchmark always posts inline. Rejected on any backend but `rdma`, since only the RDMA backend implements prepared transfers — elsewhere the run would silently fall back to the inline path mid-sweep and report a "prepared" number that never ran prepared. |
+| *(always on)* | `--skip-validate` | Both tools verify transferred data as part of the run. Python compares the target's buffer byte-for-byte over gloo; the C++ tool seeds a rank- and offset-dependent pattern and exchanges one checksum per transferred slot after the sweep (so the check is O(batch) on the wire but still covers every byte), printing `validation: OK` or naming the first mismatching slot and exiting non-zero. `--skip-validate` opts out; passing it to only one rank is safe — that rank contributes nothing and the run reports `validation: skipped` rather than hanging. |
 
 > Keep the process on the RDMA path with `MORI_DISABLE_AUTO_XGMI=1`. Use
 > `--self-ip` equal to the data-plane IP each node advertises for QP setup;
 > `0.0.0.0` will fail with `connect(...): Connection refused`.
+>
+> For `--backend xgmi`, set `MORI_DISABLE_AUTO_XGMI=0` instead and run both
+> ranks on the **same** host with different `--gpu` (XGMI is intra-node), giving
+> both the same `--master-ip`/`--self-ip`. Note this measures the *cross-process*
+> XGMI path, since the C++ tool is always two processes; the Python benchmark's
+> default single-process mode avoids cross-process overhead entirely, so the two
+> are not directly comparable at small message sizes.
 
 ## Benchmark Arguments
 

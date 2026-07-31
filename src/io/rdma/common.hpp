@@ -300,7 +300,9 @@ struct MergedWorkRequest {
 struct PreparedRdmaBatch {
   std::vector<MergedWorkRequest> mergedWrs;
   size_t mergedWrCount{0};
-  size_t batchSize{0};  // original request count (callbackMeta totalBatchSize when !creditByWrCount)
+  // Original request count; becomes callbackMeta totalBatchSize when
+  // !creditByWrCount (the chunked path overwrites it with the final WR count).
+  size_t batchSize{0};
   RdmaTransferControl control{};
   int postBatchSize{-1};
   bool isRead{false};
@@ -316,8 +318,7 @@ RdmaOpRet BuildMergedWorkRequests(const EpPairVec& eps,
                                   const application::RdmaMemoryRegion& baseRemoteMr,
                                   const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                   const SizeVec& sizes, bool isRead,
-                                  const RdmaTransferControl& control,
-                                  std::vector<size_t>& indices,
+                                  const RdmaTransferControl& control, std::vector<size_t>& indices,
                                   std::vector<MergedWorkRequest>& mergedPool,
                                   std::vector<MergedWorkRequest>& chunkedPool,
                                   std::vector<ChunkedSgeSegment>& chunkPlan,
@@ -335,7 +336,8 @@ RdmaOpRet PostMergedWorkRequests(const EpPairVec& eps,
 
 // Prepared-transfer helpers: build once, post many. BuildPreparedRdmaBatch runs
 // the build phase and stores the owned WR list in `out`. PostPreparedRdmaBatch
-// re-posts it. Both operate on the inline (non-executor) posting path.
+// re-posts it. Used both for inline posting (one list spanning every endpoint) and
+// for worker posting, where each worker owns a single-endpoint list.
 RdmaOpRet BuildPreparedRdmaBatch(const EpPairVec& eps,
                                  const application::RdmaMemoryRegion& baseLocalMr,
                                  const application::RdmaMemoryRegion& baseRemoteMr,

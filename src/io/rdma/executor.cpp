@@ -124,6 +124,24 @@ void MultithreadExecutor::Worker::MainLoop() {
       q.pop();
     }
 
+    thread_local std::vector<application::RdmaMemoryRegion> localMrPerEp(1);
+    thread_local std::vector<application::RdmaMemoryRegion> remoteMrPerEp(1);
+
+    if (task.preq != nullptr) {
+      // Prepared slice: the WR list was built by PrepareBatch, so only the
+      // per-post state (lkey/rkey, wr_id, signaling, next chain) is re-armed here.
+      localMrPerEp[0] = task.preq->local;
+      remoteMrPerEp[0] = task.preq->remote;
+
+      RdmaOpRet ret = mori::io::PostPreparedRdmaBatch(
+          {task.preq->eps[task.epId]}, localMrPerEp, remoteMrPerEp, task.preq->slices[task.sliceId],
+          task.preq->callbackMeta, task.preq->id);
+      task.ret.set_value(ret);
+      MORI_IO_TRACE("Worker {} post prepared task {} slice {} ep {} ret code {}", workerId,
+                    task.preq->id, task.sliceId, task.epId, static_cast<uint32_t>(ret.code));
+      continue;
+    }
+
     SizeVec tLoclOffsets(task.req->localOffsets.begin() + task.begin,
                          task.req->localOffsets.begin() + task.end);
     SizeVec tRemoteOffsets(task.req->remoteOffsets.begin() + task.begin,
@@ -138,8 +156,6 @@ void MultithreadExecutor::Worker::MainLoop() {
     control.ownsTotalBatchSize = false;
     control.disableMerge = chunk;
 
-    thread_local std::vector<application::RdmaMemoryRegion> localMrPerEp(1);
-    thread_local std::vector<application::RdmaMemoryRegion> remoteMrPerEp(1);
     localMrPerEp[0] = task.req->local;
     remoteMrPerEp[0] = task.req->remote;
 
@@ -180,10 +196,7 @@ MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n) {
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
-std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
-  int numEps = req.eps.size();
-  int totalBatchSize = req.sizes.size();
-
+std::vector<std::pair<int, int>> SplitBatchWork(int numEps, int numWorker, int totalBatchSize) {
   assert(numEps > 0);
 
   int numActiveWorkers = std::min(numEps, numWorker);
@@ -198,6 +211,32 @@ std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorRe
   }
 
   return splits;
+}
+
+std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
+  return SplitBatchWork(static_cast<int>(req.eps.size()), numWorker,
+                        static_cast<int>(req.sizes.size()));
+}
+
+RdmaOpRet MultithreadExecutor::AggregateResults(std::vector<std::future<RdmaOpRet>>& futs) {
+  bool hasFail = false;
+  int numSucc = 0;
+  RdmaOpRet failedRet;
+  for (auto& fut : futs) {
+    RdmaOpRet ret = fut.get();
+    if (ret.Failed()) {
+      hasFail = true;
+      failedRet = ret;
+    } else if (ret.Succeeded()) {
+      numSucc++;
+    }
+  }
+  if (hasFail) return failedRet;
+
+  if (numSucc == static_cast<int>(futs.size())) {
+    return {StatusCode::SUCCESS, ""};
+  }
+  return {StatusCode::IN_PROGRESS, ""};
 }
 
 RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
@@ -219,26 +258,37 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
     pool[epId % numWorker]->Submit(std::move(task));
   }
 
-  bool hasFail = false;
-  int numSucc = 0;
-  RdmaOpRet failedRet;
-  for (auto& fut : futs) {
-    RdmaOpRet ret = fut.get();
-    if (ret.Failed()) {
-      hasFail = true;
-      failedRet = ret;
-    } else if (ret.Succeeded()) {
-      numSucc++;
-    }
-  }
-  if (hasFail) return failedRet;
-
-  if (numSucc == numSplits) {
-    return {StatusCode::SUCCESS, ""};
-  }
-
+  RdmaOpRet ret = AggregateResults(futs);
   MORI_IO_TRACE("MultithreadExecutor submit request for RdmaBatchReadWrite done");
-  return {StatusCode::IN_PROGRESS, ""};
+  return ret;
+}
+
+RdmaOpRet MultithreadExecutor::PostPrepared(const ExecutorPreparedReq& req) {
+  MORI_IO_FUNCTION_TIMER;
+
+  int numSlices = static_cast<int>(req.slices.size());
+  int numEps = static_cast<int>(req.eps.size());
+  if (numSlices == 0) return {StatusCode::SUCCESS, ""};
+  if (numEps == 0) return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+
+  // Slices are endpoint-agnostic (addresses come from the session's base MRs and
+  // lkey/rkey are re-armed per post), so the same id-based rotation the build path
+  // uses still spreads small transfers across every QP.
+  int epOffset = static_cast<int>(req.id % static_cast<uint64_t>(numEps));
+  std::vector<std::future<RdmaOpRet>> futs;
+  futs.reserve(numSlices);
+
+  for (int i = 0; i < numSlices; i++) {
+    int epId = (i + epOffset) % numEps;
+    Task task{&req, epId, i};
+    futs.push_back(std::move(task.ret.get_future()));
+    // Keep each QP owned by a stable worker to preserve QP affinity.
+    pool[epId % numWorker]->Submit(std::move(task));
+  }
+
+  RdmaOpRet ret = AggregateResults(futs);
+  MORI_IO_TRACE("MultithreadExecutor submit request for PostPrepared done");
+  return ret;
 }
 
 void MultithreadExecutor::Start() {

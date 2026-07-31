@@ -3,5 +3,6 @@ setuptools>=65
 setuptools-scm>=8
 pybind11
 ninja
+numpy
 prettytable
 pytest-assume
