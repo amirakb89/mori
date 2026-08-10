@@ -74,6 +74,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <msgpack.hpp>
 #include <optional>
 #include <stdexcept>
@@ -429,6 +430,9 @@ struct Args {
   bool batch_contiguous = false;      // --batch-contiguous (adjacent offsets → merged WR);
                                       // default strided (each transfer a separate WR)
   bool enable_sess = false;           // --enable-sess (session fast-path); Python default: off
+  bool prepare_once = false;          // --prepare-once: build the batch's work requests once and
+                                      // re-post them every iteration, so only the post is timed
+                                      // (nixl's createXferReq / postXferReq split)
 
   std::string mem_type = "gpu";  // --mem-type gpu|cpu
   std::string init_mem_type;     // --initiator-mem-type (empty => mem_type)
@@ -470,6 +474,10 @@ void PrintUsage(const char* argv0) {
       "  --warmup-iters N         untimed warmup iterations (default: 50)\n"
       "  --enable-sess            use the session fast path (default: off)\n"
       "  --disable-sess           call the engine APIs directly\n"
+      "  --prepare-once           build the batch's work requests once per sweep point and\n"
+      "                           re-post them, so the sort/merge/chunk cost leaves the timed\n"
+      "                           loop (nixl createXferReq/postXferReq). Needs --backend rdma\n"
+      "                           with --enable-sess and --enable-batch-transfer\n"
       "\n"
       "Sweeps (default: a single point at --buffer-size):\n"
       "  --all                    sweep message size --sweep-start..--sweep-max\n"
@@ -613,6 +621,8 @@ Args ParseArgs(int argc, char** argv) {
       a.enable_sess = true;
     else if (k == "--disable-sess")
       a.enable_sess = false;
+    else if (k == "--prepare-once")
+      a.prepare_once = true;
     else if (k == "--mem-type")
       a.mem_type = next();
     else if (k == "--initiator-mem-type")
@@ -672,6 +682,21 @@ void ValidateArgs(Args& a) {
     throw std::invalid_argument("--num-initiator-dev must equal --num-target-dev (got " +
                                 std::to_string(a.num_initiator_dev) + " vs " +
                                 std::to_string(a.num_target_dev) + ")");
+  }
+  // Same three preconditions the Python bench enforces: the handle is owned by a
+  // session, RDMA is the only backend that builds one, and the whole point of the
+  // flag is to hoist the batch build, which the singles path does not do.
+  if (a.prepare_once) {
+    if (a.backend != "rdma") {
+      throw std::invalid_argument("--prepare-once requires --backend rdma (got " + a.backend + ")");
+    }
+    if (!a.enable_sess) {
+      throw std::invalid_argument(
+          "--prepare-once requires --enable-sess (prepared handles live on a session)");
+    }
+    if (!a.enable_batch_transfer) {
+      throw std::invalid_argument("--prepare-once requires --enable-batch-transfer");
+    }
   }
   if (a.xgmi_single_process && a.xgmi_multiprocess) {
     throw std::invalid_argument("--xgmi-single-process and --xgmi-multiprocess are exclusive");
@@ -845,10 +870,25 @@ std::vector<SweepResult> RunSweep(const Args& a, IOEngine& engine, const MemoryD
     TransferStatusPtrVec statusPtrs{&st[0]};
     TransferUniqueIdVec batchIds(1);
 
+    // --prepare-once: build this point's work requests ONCE here, then re-post the
+    // same handle for every warmup and timed iteration below. The descriptors are
+    // fixed at prepare time, so the timed loop pays only the post -- the same split
+    // nixl reports as createXferReq vs postXferReq.
+    std::shared_ptr<PreparedTransfer> prepared;
+    if (a.prepare_once) {
+      prepared = sessPtr->PrepareBatch(offsets, offsets, sizes, isRead);
+      if (!prepared) {
+        throw std::runtime_error("PrepareBatch failed: backend has no prepared-transfer support");
+      }
+    }
+
     auto post = [&]() {
       TransferStatus* base = &st[0];
       for (int i = 0; i < perSlot; ++i) base[i].SetCode(StatusCode::INIT);
-      if (batched) {
+      if (a.prepare_once) {
+        // One prepared request per iteration, with a fresh id and status each time.
+        sessPtr->PostPrepared(prepared, &base[0], sessPtr->AllocateTransferUniqueId());
+      } else if (batched) {
         // ONE N-descriptor batch request (nixl / Python --enable-batch-transfer).
         TransferUniqueId id =
             useSess ? sessPtr->AllocateTransferUniqueId() : engine.AllocateTransferUniqueId();
