@@ -2,6 +2,7 @@
 
 ## Table of Contents
 
+- [Before an internode run](#before-an-internode-run)
 - [Benchmark Commands](#benchmark-commands)
 - [Benchmark Arguments](#benchmark-arguments)
 - [Results: Thor2 RDMA Read](#results-thor2-rdma-read)
@@ -11,6 +12,30 @@
 - [Results: CX7 RDMA (Batch Size = 1)](#results-cx7-rdma-batch-size--1)
   - [Write](#write)
   - [Read](#read)
+
+## Before an internode run
+
+Validate the fabric before collecting numbers across nodes:
+
+```bash
+mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
+```
+
+It exits non-zero if any check failed. Three results change how you should read
+the benchmark output:
+
+- **Firmware not known-good** — the wrong NIC firmware is the most common cause
+  of cross-node RDMA misbehaviour, and it surfaces as bad MORI numbers rather
+  than as an obvious firmware problem.
+- **Rail-only fabric** (`0/N cross-rail pairs reachable`) — every NIC reaches
+  only its own rail on the peer. MORI-IO works there with
+  `MORI_IO_RAIL_AFFINITY=1`, which keeps each transfer on its own rail.
+- **Rails below threshold** — the per-rail GPU-memory pass is the serial,
+  quotable figure. If a rail is short of line rate there, no benchmark tuning
+  below will recover it.
+
+The reachability matrices are measured concurrently and are labelled as such:
+use them to answer "is this pair connected", not as bandwidth results.
 
 ## Benchmark Commands
 
