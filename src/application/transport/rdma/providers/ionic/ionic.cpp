@@ -27,6 +27,7 @@
 #include <infiniband/verbs.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,13 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 
 namespace {
+
+// Host-pinned control buffers (MORI_IONIC_HOST_CTRL_BUF=1) avoid the peermem
+// requirement on the ionic create_cq/create_qp ioctls: on dma_buf-only fabrics
+// GPU VRAM rings return EFAULT/EIO from the kernel driver. hipHostMalloc memory
+// stays GPU-accessible over PCIe, so GPU-initiated SQ writes / CQ polling still
+// work. Mirrors rocSHMEM's GDA backend (host-pinned QP/CQ buffers when dmabuf).
+bool IonicUseHostCtrlBuf() { return env::IsEnvVarEnabled("MORI_IONIC_HOST_CTRL_BUF"); }
 
 using FwVersion = std::tuple<int, int, int, int>;
 constexpr FwVersion kCcqeMinFwVersion{1, 117, 5, 58};
@@ -107,6 +115,25 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   const bool ccqe_enabled = IsCcqeSupported(context);
 
+  // SPIKE (MORI_IONIC_HOST_CQ=1): build the CQ with plain ibv_create_cq and NO
+  // parent domain. The default path pins the CQ ring in GPU VRAM via the
+  // parent-domain allocator, which needs peermem (absent on dma_buf-only
+  // fabrics -> EFAULT). This probe checks whether ionic_dv_get_cq can still
+  // hand a GPU-mappable q.ptr back for a plainly-created CQ.
+  const bool hostCq = env::IsEnvVarEnabled("MORI_IONIC_HOST_CQ");
+  if (hostCq) {
+    MORI_APP_WARN("MORI_IONIC_HOST_CQ=1: creating plain ibv_create_cq (no parent domain)");
+    errno = 0;
+    cq = ibv_create_cq(context, cqeNum * 2, nullptr, nullptr, 0);
+    if (!cq) {
+      MORI_APP_ERROR("ibv_create_cq (host) returned NULL: errno={} ({}), cqe={}", errno,
+                     strerror(errno), cqeNum * 2);
+    }
+    assert(cq);
+    MORI_APP_TRACE("IONIC host CQ created (plain)");
+    return;
+  }
+
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   cq_attr.cq_context = nullptr;
   cq_attr.channel = nullptr;
@@ -122,11 +149,23 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
     ionic_cq_attr.comp_mask = IONIC_CQ_INIT_ATTR_MASK_FLAGS;
     ionic_cq_attr.flags = IONIC_CQ_INIT_ATTR_CCQE;
     cq_attr.cqe = 1;
+    errno = 0;
     cq_ex = IonicDvApi::Instance().create_cq_ex(context, &cq_attr, &ionic_cq_attr);
+    if (!cq_ex) {
+      MORI_APP_ERROR(
+          "ionic_dv_create_cq_ex (CCQE) returned NULL: errno={} ({}), cqe={}, "
+          "comp_mask={:#x}, parent_domain(pd)={}, ionic_flags={:#x}",
+          errno, strerror(errno), cq_attr.cqe, cq_attr.comp_mask, (void*)pd, ionic_cq_attr.flags);
+    }
   } else {
     MORI_APP_TRACE("cqe mode: normal mode");
     cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
+    errno = 0;
     cq_ex = ibv_create_cq_ex(context, &cq_attr);
+    if (!cq_ex) {
+      MORI_APP_ERROR("ibv_create_cq_ex (normal) returned NULL: errno={} ({}), cqe={}", errno,
+                     strerror(errno), cq_attr.cqe);
+    }
   }
 
   assert(cq_ex);
@@ -249,7 +288,15 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   attr.pd = pd_uxdma;
   attr.send_cq = cq;
   attr.recv_cq = cq;
+  errno = 0;
   qp = ibv_create_qp_ex(context, &attr);
+  if (!qp) {
+    MORI_APP_ERROR(
+        "ibv_create_qp_ex returned NULL: errno={} ({}), pd(parent_domain)={}, cq={}, "
+        "max_send_wr={}, max_recv_wr={}",
+        errno, strerror(errno), (void*)pd_uxdma, (void*)cq, attr.cap.max_send_wr,
+        attr.cap.max_recv_wr);
+  }
   assert(qp);
 
   HIP_RUNTIME_CHECK(hipGetDevice(&hip_dev_id));
@@ -304,8 +351,12 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   // Allocate and register atomic internal buffer (ibuf)
   atomicIbufSize = (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(
-        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
+    if (IonicUseHostCtrlBuf()) {
+      HIP_RUNTIME_CHECK(hipHostMalloc(&atomicIbufAddr, atomicIbufSize, hipHostMallocCoherent));
+    } else {
+      HIP_RUNTIME_CHECK(
+          hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
+    }
     HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
   } else {
     err = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
@@ -337,7 +388,11 @@ IonicQpContainer::~IonicQpContainer() {
 
   if (atomicIbufAddr) {
     if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
+      if (IonicUseHostCtrlBuf()) {
+        HIP_RUNTIME_CHECK(hipHostFree(atomicIbufAddr));
+      } else {
+        HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
+      }
     } else {
       free(atomicIbufAddr);
     }
@@ -441,14 +496,27 @@ void IonicQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
 /* ---------------------------------------------------------------------------------------------- */
 void IonicDeviceContext::pd_release(struct ibv_pd* pd, void* pd_context, void* ptr,
                                     uint64_t resource_type) {
-  HIP_RUNTIME_CHECK(hipFree(ptr));
+  if (IonicUseHostCtrlBuf()) {
+    HIP_RUNTIME_CHECK(hipHostFree(ptr));
+  } else {
+    HIP_RUNTIME_CHECK(hipFree(ptr));
+  }
 }
 
 void* IonicDeviceContext::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_context, size_t size,
                                                    size_t alignment, uint64_t resource_type) {
   void* dev_ptr{nullptr};
-  HIP_RUNTIME_CHECK(
-      hipExtMallocWithFlags(reinterpret_cast<void**>(&dev_ptr), size, hipDeviceMallocUncached));
+  if (IonicUseHostCtrlBuf()) {
+    // Coherent (fine-grained) host memory: the NIC writes CQEs here and the GPU
+    // kernel polls them (PollCq<PSD>). Default/cacheable host memory can leave the
+    // GPU poller reading a stale line forever; coherent mapping makes NIC->mem
+    // writes visible to the GPU and GPU->mem WQE writes visible to the NIC.
+    HIP_RUNTIME_CHECK(
+        hipHostMalloc(reinterpret_cast<void**>(&dev_ptr), size, hipHostMallocCoherent));
+  } else {
+    HIP_RUNTIME_CHECK(
+        hipExtMallocWithFlags(reinterpret_cast<void**>(&dev_ptr), size, hipDeviceMallocUncached));
+  }
   memset(dev_ptr, 0, size);
   return dev_ptr;
 }
