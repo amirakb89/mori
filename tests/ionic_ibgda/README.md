@@ -8,6 +8,21 @@ fails at `ionic_dv_create_cq_ex`.
 
 ## Tests
 
+- `ibgda_qp_create_test.cpp` — **self-contained IBGDA capability probe.**
+  Replicates MORI's exact GPU-initiated queue-creation path on a single node
+  (parent domain with a GPU-VRAM ring allocator -> `ionic_dv_create_cq_ex` with
+  CCQE -> RC QP -> `ionic_dv_qp_set_gda` -> GPU doorbell handle) and reports
+  which step first fails. No peer, no `amdgpu_peermem` needed. Exit code =
+  first failing step (0 = passed through setup).
+  - Default (GPU-VRAM rings): fails at step 3, `ionic_dv_create_cq_ex`
+    `errno=14 (EFAULT)` -- the ring cannot be pinned for the NIC without peermem
+    or a dma-buf queue path.
+  - `MORI_IONIC_HOST_CTRL_BUF=1` (coherent host rings): steps 3-6 pass -- CQ,
+    QP, GDA-enable, and doorbell handle all succeed, isolating the failure to
+    GPU-VRAM ring pinning specifically.
+  - Also reports that `ionic_dv_qp_get_send_dbell_data` is declared in
+    `ionic_dv.h` but not exported by the installed libionic.
+
 - `doorbell_test.cpp` — maps the real `ionic_0` doorbell BAR into GPU address
   space (`hsa_amd_memory_lock_to_pool`, same call as MORI's
   `rocm_memory_lock_to_fine_grain`) and has a GPU kernel do one MMIO store to
