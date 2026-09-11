@@ -203,7 +203,9 @@ static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigi
       advice.hint =
           "transport retry limit exceeded; check peer liveness/connectivity, verify GID "
           "selection (unset or correct MORI_IB_GID_INDEX), and if running RoCE verify QoS "
-          "settings such as MORI_IO_SL/MORI_IO_TC or MORI_RDMA_SL/MORI_RDMA_TC.";
+          "settings such as MORI_IO_SL/MORI_IO_TC or MORI_RDMA_SL/MORI_RDMA_TC. A peer that is "
+          "alive but slow to ack needs a longer retry budget: raise MORI_IO_QP_TIMEOUT (default "
+          "14, ~537ms) and/or MORI_IO_QP_RETRY_CNT (default 7).";
       break;
     case IBV_WC_RNR_RETRY_EXC_ERR:
       if (origin == CqeFailureOrigin::NotificationSend) {
