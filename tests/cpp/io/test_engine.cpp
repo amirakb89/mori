@@ -1896,8 +1896,11 @@ void CaseXgmiCrossEngineIpc() {
   auto srcMem = RegisterGpuMemory(engineA.get(), kSize, 0);
   auto dstMem = RegisterGpuMemory(engineB.get(), kSize, 1);
 
+  // Sync both devices: the XGMI copy runs on a backend stream on device 1, which is not
+  // ordered after device 0's memset.
   HIP_RUNTIME_CHECK(hipSetDevice(0));
   HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   HIP_RUNTIME_CHECK(hipSetDevice(1));
   HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
