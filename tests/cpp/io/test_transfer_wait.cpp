@@ -19,6 +19,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+// Exercised by the Radeon R9700 MORI-IO CI lane (ci_radeon_io.yml).
 #include <array>
 #include <atomic>
 #include <chrono>
