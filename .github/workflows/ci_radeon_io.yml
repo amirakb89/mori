@@ -83,10 +83,7 @@ jobs:
        (github.event.action != 'labeled' || github.event.label.name == 'ci:radeon') &&
        (github.event.pull_request.head.repo.full_name == github.repository ||
         contains(github.event.pull_request.labels.*.name, 'ci:radeon')))
-    # xsj-dispatch opts the job into the XSJ-Dispatch runner pool; radeon-r9700
-    # picks the hardware. The job stays queued until a runner with all four
-    # labels is online.
-    runs-on: [self-hosted, linux, xsj-dispatch, radeon-r9700]
+    runs-on: [self-hosted, linux, radeon-r9700]
     timeout-minutes: 75
     steps:
       - name: Fix workspace permissions
