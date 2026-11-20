@@ -1703,6 +1703,64 @@ void WriteAndWait(BackendSession* sess, size_t size, TransferUniqueId id, const 
                                   ", msg='" + status.Message() + "'");
 }
 
+// A fence frees the QPs it cut on the fencing side: they never carry traffic again. Without
+// that, every fence/unfence cycle leaves a full set allocated, since the producer connects
+// again with new QPs after each unfence.
+void CaseRdmaFenceFreesCutQps() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+  if (!RdmaBackend::HasActiveDevices()) throw TestSkip("requires at least one active RDMA device");
+  ScopedEnvVar qps("MORI_IO_QP_PER_TRANSFER", "2");
+  constexpr size_t kSize = 64 * 1024;
+
+  DirectRdmaBackend producer = MakeDirectRdmaBackend("fence_free_producer");
+  DirectRdmaBackend receiver = MakeDirectRdmaBackend("fence_free_receiver");
+  producer.backend->RegisterRemoteEngine(receiver.desc);
+  receiver.backend->RegisterRemoteEngine(producer.desc);
+  RegisteredGpuMem src = AllocGpu(kSize, 0xA1);
+  RegisteredGpuMem dst = AllocGpu(kSize, 0x00);
+  MemoryDesc srcDesc = RegisterOnBackend(producer, src, kSize);
+  MemoryDesc dstDesc = RegisterOnBackend(receiver, dst, kSize);
+
+  size_t connected = 0;
+  TransferUniqueId id = 1;
+  for (int cycle = 0; cycle < 4; ++cycle) {
+    // After an unfence the producer's first writes may still go out on the QPs the fence
+    // cut, until it learns they died; then it connects again.
+    bool wrote = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!wrote && std::chrono::steady_clock::now() < deadline) {
+      try {
+        std::unique_ptr<BackendSession> sess(producer.backend->CreateSession(srcDesc, dstDesc));
+        TransferStatus status;
+        sess->Write(0, 0, kSize, &status, id++);
+        WaitOrAbort(&status, 10000, "write in cycle " + std::to_string(cycle));
+        wrote = status.Succeeded();
+      } catch (const std::exception&) {
+      }
+      if (!wrote) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    Require(wrote, "cycle " + std::to_string(cycle) + ": the producer could not write");
+    if (cycle == 0) connected = receiver.backend->NumConnectedEndpoints();
+    Require(connected > 0 && receiver.backend->NumConnectedEndpoints() == connected,
+            "cycle " + std::to_string(cycle) + ": the receiver holds " +
+                std::to_string(receiver.backend->NumConnectedEndpoints()) + " QP(s), expected " +
+                std::to_string(connected) + " (QPs cut by earlier fences were not freed)");
+
+    FenceResult fence = receiver.backend->FenceRemoteEngine(producer.desc.key);
+    Require(fence.Ok() && fence.endpointsFenced == static_cast<int>(connected),
+            "cycle " + std::to_string(cycle) + ": fence must cut every QP: " + fence.message);
+    Require(receiver.backend->NumConnectedEndpoints() == 0,
+            "cycle " + std::to_string(cycle) + ": " +
+                std::to_string(receiver.backend->NumConnectedEndpoints()) +
+                " QP(s) left after the fence; cut QPs must be freed");
+    Require(receiver.backend->UnfenceRemoteEngine(producer.desc.key),
+            "the producer must have been fenced");
+  }
+
+  receiver.backend->DeregisterMemory(dstDesc);
+  producer.backend->DeregisterMemory(srcDesc);
+}
+
 // Deregistering a remote engine tears down its QPs: a session still held to it is dead
 // and fails at once, its QPs are destroyed once it is dropped, and registering the
 // engine again builds new ones. Without the teardown the QPs pile up with every cycle.
@@ -2935,6 +2993,7 @@ int main(int argc, char* argv[]) {
        CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_deregister_frees_qps_and_rebuilds", CaseRdmaDeregisterFreesQpsAndRebuilds},
+      {"rdma_fence_frees_cut_qps", CaseRdmaFenceFreesCutQps},
       {"rdma_deregister_then_replaced_engine_gets_the_data",
        CaseRdmaDeregisterThenReplacedEngineGetsTheData},
       {"rdma_deregister_leaves_an_uncut_qp_running", CaseRdmaDeregisterLeavesAnUncutQpRunning},

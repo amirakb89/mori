@@ -186,8 +186,9 @@ class RdmaManager {
   // Takes every connection to `remoteKey` out of service. Each QP is moved to
   // Error so the peer can no longer write through it, then removed from the route
   // table so no new session picks it up, and its in-flight transfers are failed.
-  // The QP objects stay allocated: the CQ poller still drains their flush CQEs, and
-  // freeing them under it would race. Registered memory is left untouched, so the
+  // Fills `cutEndpoints` with the endpoints it cut, still registered and polled: the caller
+  // removes them (RemoveEndpoints, NotifManager::UnregisterEndpoints), and they are
+  // freed once no session holds them. Registered memory is left untouched, so the
   // peer can reconnect through the normal handshake.
   //
   // The peer also stays fenced: ConnectEndpoint refuses it, in either direction,
@@ -195,7 +196,7 @@ class RdmaManager {
   // that notices its connection died would rebuild one and keep writing; whatever
   // it still had queued for the abandoned transfer would then land in memory that
   // may already belong to someone else.
-  FenceResult FenceRemoteEngine(const EngineKey& remoteKey);
+  FenceResult FenceRemoteEngine(const EngineKey& remoteKey, SnapshotVector* cutEndpoints);
 
   // Lets a fenced peer connect again. The caller decides when that is safe, which is
   // once nothing the peer still has queued can reach buffers that were handed out.
@@ -620,9 +621,9 @@ class RdmaBackend : public Backend {
   std::unordered_map<EngineKey, std::shared_ptr<std::mutex>> peerLocks_;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
-  // Failed QPs stay allocated until their remote engine is deregistered, so QPs that fail
-  // again soon after being replaced, as on a path that stays down, are replaced at a
-  // growing interval. Guarded by connBuildMapMu_.
+  // Failed QPs stay allocated until their remote engine is deregistered or fenced, so QPs
+  // that fail again soon after being replaced, as on a path that stays down, are replaced
+  // at a growing interval. Guarded by connBuildMapMu_.
   std::unordered_map<ConnBuildKey, QpReplacementPacing, ConnBuildKeyHash> qpReplacementPacing_;
   // One fence or unfence at a time, start to end: an unfence between the steps of a fence
   // would let the peer back in while the fence goes on to treat it as fenced.

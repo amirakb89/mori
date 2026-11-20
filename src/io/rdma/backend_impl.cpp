@@ -985,7 +985,8 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
   return failed;
 }
 
-FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
+FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey,
+                                           SnapshotVector* cutEndpoints) {
   // The caller runs one fence or unfence at a time (RdmaBackend::fenceMu_): a concurrent
   // fence would find the route table already emptied by this one and report the peer cut
   // off before these QPs are.
@@ -1074,6 +1075,13 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
   CutConnections& allCut = cutConnections_[remoteKey];
   allCut.localQpns.insert(allCut.localQpns.end(), cut.localQpns.begin(), cut.localQpns.end());
   allCut.peerQpns.insert(allCut.peerQpns.end(), cut.peerQpns.begin(), cut.peerQpns.end());
+  std::unordered_set<const EndpointResources*> cutResources;
+  for (size_t i = 0; i < victims.size(); ++i) {
+    if (isCut[i]) cutResources.insert(victims[i].resources.get());
+  }
+  for (const auto& [_, rt] : endpointsById_) {
+    if (cutResources.count(rt->ep.resources.get()) != 0) cutEndpoints->push_back(rt);
+  }
   if (result.endpointsFailed > 0) {
     result.message = std::to_string(result.endpointsFailed) + " of " +
                      std::to_string(victims.size()) + " endpoint(s) of peer " + remoteKey +
@@ -2639,14 +2647,30 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   // Fence before dropping sessions. The other way round, a CreateSession racing
   // with us could still see the old endpoints, cache a session over them, and leave
   // it pointing at dead QPs once the fence lands.
-  FenceResult result = rdma->FenceRemoteEngine(remote);
+  RdmaManager::SnapshotVector cut;
+  FenceResult result = rdma->FenceRemoteEngine(remote, &cut);
   result.peerKnown = result.peerKnown || server->TryGetRemoteEnginePort(remote).has_value();
+  // The cut QPs never carry traffic again: out of the poll loop, then freed with the last
+  // session that still holds one.
+  rdma->RemoveEndpoints(cut);
+  notif->UnregisterEndpoints(cut);
   notif->ForgetRemoteEngine(remote);
 
-  std::lock_guard<std::mutex> lock(sessionCacheMu);
-  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
-    it = it->first.remoteEngineKey == remote ? sessionCache.erase(it) : std::next(it);
+  std::vector<std::shared_ptr<RdmaBackendSession>> sessions;
+  {
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+      if (it->first.remoteEngineKey == remote) {
+        sessions.push_back(std::move(it->second));
+        it = sessionCache.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
+  sessions.clear();
+  cut.clear();
+  rdma->DestroyReleasedEndpoints();
   return result;
 }
 
