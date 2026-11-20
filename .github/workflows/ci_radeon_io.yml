@@ -3,8 +3,17 @@ name: MoRI-IO Radeon R9700 (gfx1201)
 # MORI-IO only, on a 2x Radeon AI Pro R9700S host. The GPUs have no XGMI link:
 # the xgmi backend (HIP IPC + hipMemcpyPeerAsync) runs over PCIe Gen4 P2P, so
 # this lane checks correctness and a PCIe-class bandwidth floor, not XGMI speed.
-# gfx1201 is not in MORI's supported arch list, so only the host-side IO library
-# and its C++ tests are built (GPU_TARGETS pinned, ops/shmem/cco/pybinds off).
+#
+# The host has no RDMA NIC, so the lane runs every MORI-IO check that needs
+# none: the C++ engine and wait tests, the protocol, peer-failure, rail-affinity
+# and discrete-buffer tests, the fault catalog self-checks, the RAS tests, the
+# xgmi benchmarks, and the Python tests that use XGMI or the simulated backends.
+#
+# gfx1201 is not in MORI's supported arch list, so GPU_TARGETS is pinned and the
+# C++ builds leave ops/shmem/cco off. The Python step needs the bindings, which
+# link ops and shmem, so `pip install .` builds those for gfx1201 too. A change
+# under src/ops or src/shmem does not trigger this lane; the nightly run is what
+# shows a break of that build.
 
 on:
   pull_request:
@@ -17,11 +26,20 @@ on:
       - "docker/Dockerfile.dev"
       - "include/mori/application/**"
       - "include/mori/io/**"
+      - "include/mori/ras/**"
       - "include/mori/utils/**"
+      - "pyproject.toml"
+      - "python/mori/io/**"
+      - "setup.py"
       - "src/application/**"
       - "src/io/**"
+      - "src/pybind/**"
+      - "src/ras/**"
       - "tests/cpp/CMakeLists.txt"
       - "tests/cpp/io/**"
+      - "tests/cpp/ras/**"
+      - "tests/python/io/**"
+      - "tests/python/utils.py"
   schedule:
     - cron: '0 7 * * *'
   workflow_dispatch:
@@ -45,6 +63,14 @@ env:
   MIN_BW_GBPS: ${{ inputs.min_bw_gbps || '20' }}
   # The GPUs are shared with other users; wait this long for them to go idle.
   GPU_IDLE_WAIT_S: "1800"
+  # Host-side IO library and its tests only. Each build adds -DGPU_TARGETS=$GFX.
+  IO_CMAKE_FLAGS: >-
+    -G Ninja -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_APPLICATION=ON
+    -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_CCO_SDMA=OFF
+    -DBUILD_COLLECTIVE=OFF -DBUILD_PYBINDS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+    -DBUILD_METRICS=OFF -DBUILD_NETMON=OFF -DBUILD_XGMI_NETMON=OFF -DBUILD_UMBP=OFF
+    -DMORI_USE_LIBFABRIC=OFF
 
 jobs:
   mori-io:
@@ -104,6 +130,7 @@ jobs:
           echo "IMAGE=$tag" >> $GITHUB_ENV
 
       - name: Start container
+        id: container
         run: |
           docker rm -f $CONTAINER 2>/dev/null || true
           docker run -d --name $CONTAINER --network host --ipc host \
@@ -114,19 +141,17 @@ jobs:
           docker exec $CONTAINER git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Build MORI-IO
+        id: build_io
         run: |
           docker exec $CONTAINER bash -c "
             set -e
-            cmake -S . -B build_io -G Ninja -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=$GFX \
-              -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_APPLICATION=ON \
-              -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_CCO_SDMA=OFF \
-              -DBUILD_COLLECTIVE=OFF -DBUILD_PYBINDS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
-              -DBUILD_METRICS=OFF -DBUILD_NETMON=OFF -DBUILD_XGMI_NETMON=OFF -DBUILD_UMBP=OFF \
-              -DMORI_USE_LIBFABRIC=OFF
-            cmake --build build_io -j --target test_engine test_transfer_wait bench_engine
+            cmake -S . -B build_io $IO_CMAKE_FLAGS -DGPU_TARGETS=$GFX
+            cmake --build build_io -j --target test_engine test_transfer_wait bench_engine \
+              test_protocol test_peer_failure test_rail_affinity test_discrete_buffer
           "
 
       - name: MORI-IO C++ (test_engine, test_transfer_wait)
+        id: cpp_core
         run: |
           # The XGMI hidden-device cases re-launch the binary under a narrower
           # HIP_VISIBLE_DEVICES, so the parent must see both GPUs.
@@ -137,6 +162,7 @@ jobs:
           "
 
       - name: MORI-IO xgmi benchmark (single process, GPU0 -> GPU1)
+        id: bench_single
         run: |
           mkdir -p io-logs
           docker exec $CONTAINER bash -c "
@@ -147,6 +173,7 @@ jobs:
           exit ${PIPESTATUS[0]}
 
       - name: MORI-IO xgmi benchmark (two processes, hipIpc)
+        id: bench_mp
         run: |
           docker exec $CONTAINER bash -c '
             B=./build_io/tests/cpp/bench_engine
@@ -164,6 +191,7 @@ jobs:
           '
 
       - name: Check validation and bandwidth floor
+        id: bw_check
         run: |
           status=0
           for f in io-logs/xgmi_single.log io-logs/xgmi_mp_rank0.log; do
@@ -180,11 +208,97 @@ jobs:
           done
           exit $status
 
+      # The groups below run even when an earlier group failed, so that one
+      # failure does not hide the results of the others.
+      - name: MORI-IO C++ (protocol, peer failure, rail affinity, discrete buffer)
+        id: cpp_extra
+        if: ${{ !cancelled() && steps.build_io.outcome == 'success' }}
+        run: |
+          # ci.yml does not run these four. They need no RDMA device.
+          docker exec -e MORI_IO_LOG_LEVEL=error $CONTAINER bash -c "
+            set -e
+            timeout 120 ./build_io/tests/cpp/test_protocol
+            timeout 120 ./build_io/tests/cpp/test_peer_failure
+            timeout 120 ./build_io/tests/cpp/test_rail_affinity
+            timeout 300 ./build_io/tests/cpp/test_discrete_buffer
+          "
+
+      - name: MORI-IO fault catalog self-checks
+        id: fault
+        if: ${{ !cancelled() && steps.container.outcome == 'success' }}
+        run: |
+          # The checks of ci.yml's fault catalog step that need no GPU or NIC. The
+          # catalog entries themselves inject NIC faults, so every one of them
+          # skips on this host and they are not run.
+          docker exec -e MORI_IO_LOG_LEVEL=error $CONTAINER bash -c "
+            set -e
+            cmake -S . -B build_fault $IO_CMAKE_FLAGS -DGPU_TARGETS=$GFX -DENABLE_IO_FAULT_INJECTION=ON
+            cmake --build build_fault -j --target test_fault_injection test_fault_injector test_flat_yaml
+            timeout 60 ./build_fault/tests/cpp/test_flat_yaml
+            ./build_fault/tests/cpp/test_fault_injection --check-catalog
+            MORI_IO_FAULT_CATALOG=async_events.yaml ./build_fault/tests/cpp/test_fault_injection --check-catalog
+            ./build_fault/tests/cpp/test_fault_injection --check-async-sources
+            timeout 60 ./build_fault/tests/cpp/test_fault_injector
+          "
+
+      - name: MORI-RAS C++
+        id: ras
+        if: ${{ !cancelled() && steps.container.outcome == 'success' }}
+        run: |
+          docker exec $CONTAINER bash -c "
+            set -e
+            cmake -S . -B build_ras $IO_CMAKE_FLAGS -DGPU_TARGETS=$GFX -DBUILD_RAS=ON
+            cmake --build build_ras -j --target ras_tests
+            cd build_ras && timeout 300 ctest -R '^ras_' --output-on-failure
+          "
+
+      - name: Install MORI (Python bindings)
+        id: pip
+        if: ${{ !cancelled() && steps.container.outcome == 'success' }}
+        run: |
+          # Without both GPUs the XGMI tests below would skip and the step would
+          # pass without testing anything.
+          docker exec -e MORI_GPU_ARCHS=$GFX $CONTAINER bash -c "
+            set -e
+            pip install .
+            python3 -c 'import torch; n = torch.cuda.device_count(); assert n >= 2, f\"{n} GPU(s) visible, need 2\"'
+          "
+
+      - name: MORI-IO Python (XGMI and simulated backends)
+        id: python
+        if: ${{ !cancelled() && steps.pip.outcome == 'success' }}
+        run: |
+          # ci.yml runs all of tests/python/io. Here the tests that need an RDMA
+          # device are left out: test_engine_multi_session_batch.py, and the
+          # tests of test_engine.py that create an RDMA backend.
+          docker exec -e PYTHONPATH=$GITHUB_WORKSPACE -e MORI_IO_LOG_LEVEL=error $CONTAINER bash -c "
+            set -e
+            timeout 600 pytest -v tests/python/io/test_engine.py -k 'xgmi and not rdma'
+            timeout 600 pytest -v tests/python/io/test_discrete_buffer.py \
+              tests/python/io/test_xgmi_suballocation.py tests/python/io/test_transfer_wait.py \
+              tests/python/io/test_sim_backend.py
+            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+              timeout 300 pytest -v tests/python/io/test_discrete_buffer.py -k 'not performance'
+          "
+
       - name: Summary
         if: always()
         run: |
           {
-            echo "## MORI-IO xgmi on Radeon R9700 (PCIe Gen4 P2P)"
+            echo "## MORI-IO on Radeon R9700 (gfx1201, no RDMA NIC)"
+            echo '| Group | Result |'
+            echo '| --- | --- |'
+            echo '| C++ engine and wait tests | ${{ steps.cpp_core.outcome }} |'
+            echo '| xgmi benchmark, single process | ${{ steps.bench_single.outcome }} |'
+            echo '| xgmi benchmark, two processes | ${{ steps.bench_mp.outcome }} |'
+            echo '| Validation and bandwidth floor | ${{ steps.bw_check.outcome }} |'
+            echo '| C++ protocol, peer failure, rail affinity, discrete buffer | ${{ steps.cpp_extra.outcome }} |'
+            echo '| Fault catalog self-checks | ${{ steps.fault.outcome }} |'
+            echo '| RAS C++ | ${{ steps.ras.outcome }} |'
+            echo '| Python bindings install | ${{ steps.pip.outcome }} |'
+            echo '| Python XGMI and simulated backends | ${{ steps.python.outcome }} |'
+            echo
+            echo "## xgmi over PCIe Gen4 P2P"
             for f in io-logs/xgmi_single.log io-logs/xgmi_mp_rank0.log; do
               [ -f "$f" ] || continue
               echo "### $(basename $f .log)"
